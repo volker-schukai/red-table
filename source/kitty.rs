@@ -10,6 +10,7 @@ use std::{
     },
 };
 
+use flate2::{Compression, write::ZlibEncoder};
 use image::DynamicImage;
 use ratatui::{
     buffer::{Buffer, CellDiffOption},
@@ -25,6 +26,9 @@ const MAX_IMAGE_ID: u32 = 0x00FF_FFFF;
 const CHARS_PER_CHUNK: usize = 4096;
 const BYTES_PER_CHUNK: usize = (CHARS_PER_CHUNK / 4) * 3;
 const MAX_TRACKED_IMAGE_IDS: usize = 512;
+/// RGBA payloads at or above this size are zlib-compressed (`o=z`) before
+/// Base64 encoding.
+const COMPRESSION_THRESHOLD_BYTES: usize = 1024 * 1024;
 static NEXT_IMAGE_ID: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Clone)]
@@ -126,6 +130,16 @@ impl KittySession {
         }
     }
 
+    pub(crate) fn has_pending_cleanup(&self) -> bool {
+        !self
+            .inner
+            .state
+            .lock()
+            .expect("Kitty session state should not be poisoned")
+            .pending_deletions
+            .is_empty()
+    }
+
     #[cfg(test)]
     fn pending_cleanup_count(&self) -> usize {
         self.inner
@@ -165,7 +179,7 @@ impl KittyProtocol {
         Ok(Self {
             needs_transmission: AtomicBool::new(true),
             ever_transmitted: AtomicBool::new(false),
-            transmission: transmit_virtual(&image, size, id, session.inner.is_tmux),
+            transmission: transmit_virtual(image, size, id, session.inner.is_tmux),
             id_color: format!("\x1b[38;2;{red};{green};{blue}m"),
             id,
             size,
@@ -175,6 +189,11 @@ impl KittyProtocol {
 
     pub(crate) const fn size(&self) -> Size {
         self.size
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn id(&self) -> u32 {
+        self.id
     }
 
     pub(crate) fn resident_bytes(&self) -> u64 {
@@ -294,9 +313,10 @@ fn next_image_id() -> u32 {
         .expect("image ID update closure always returns a value")
 }
 
-fn transmit_virtual(image: &DynamicImage, size: Size, id: u32, is_tmux: bool) -> String {
-    let rgba = image.to_rgba8();
-    let bytes = rgba.as_raw();
+fn transmit_virtual(image: DynamicImage, size: Size, id: u32, is_tmux: bool) -> String {
+    let rgba = image.into_rgba8();
+    let (pixel_width, pixel_height) = rgba.dimensions();
+    let (bytes, compressed) = compress_payload(rgba.into_raw());
     let chunks = bytes.chunks(BYTES_PER_CHUNK);
     let chunk_count = chunks.len();
     let (start, escape, end) = Parser::tmux_start_escape_end(is_tmux);
@@ -311,13 +331,13 @@ fn transmit_virtual(image: &DynamicImage, size: Size, id: u32, is_tmux: bool) ->
         if index == 0 {
             write!(
                 output,
-                "i={id},a=T,U=1,N=1,c={},r={},f=32,t=d,s={},v={},",
-                size.width,
-                size.height,
-                rgba.width(),
-                rgba.height()
+                "i={id},a=T,U=1,N=1,c={},r={},f=32,t=d,s={pixel_width},v={pixel_height},",
+                size.width, size.height,
             )
             .expect("writing to a String cannot fail");
+            if compressed {
+                output.push_str("o=z,");
+            }
         }
         let more = u8::from(index + 1 < chunk_count);
         write!(output, "m={more};").expect("writing to a String cannot fail");
@@ -326,6 +346,23 @@ fn transmit_virtual(image: &DynamicImage, size: Size, id: u32, is_tmux: bool) ->
         output.push_str(end);
     }
     output
+}
+
+/// Compresses payloads at or above the threshold with zlib at the fastest
+/// level. Returns the raw bytes when compression is skipped or does not shrink
+/// the payload.
+fn compress_payload(raw: Vec<u8>) -> (Vec<u8>, bool) {
+    if raw.len() < COMPRESSION_THRESHOLD_BYTES {
+        return (raw, false);
+    }
+    let mut encoder = ZlibEncoder::new(Vec::with_capacity(raw.len() / 2), Compression::fast());
+    if encoder.write_all(&raw).is_err() {
+        return (raw, false);
+    }
+    match encoder.finish() {
+        Ok(compressed) if compressed.len() < raw.len() => (compressed, true),
+        _ => (raw, false),
+    }
 }
 
 fn delete_image(id: u32, is_tmux: bool) -> String {
@@ -647,10 +684,76 @@ mod tests {
     #[test]
     fn transmission_declares_virtual_placement_extent_and_exact_rgba_payload() {
         let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 255])));
-        let command = transmit_virtual(&image, Size::new(32, 14), 42, false);
+        let command = transmit_virtual(image, Size::new(32, 14), 42, false);
 
         assert!(command.starts_with("\x1b_Gq=2,i=42,a=T,U=1,N=1,c=32,r=14,f=32,t=d,s=1,v=1,m=0;"));
         assert!(command.ends_with("/wAA/w==\x1b\\"));
+    }
+
+    /// Splits a direct (non-tmux) transmission into its chunk payloads and
+    /// returns the decoded bytes plus the first chunk's control keys.
+    fn decode_transmission(command: &str) -> (String, Vec<u8>) {
+        let mut header = None;
+        let mut payload = Vec::new();
+        for chunk in command.split("\x1b\\").filter(|chunk| !chunk.is_empty()) {
+            let body = chunk
+                .strip_prefix("\x1b_G")
+                .expect("every chunk is a graphics command");
+            let (keys, data) = body.split_once(';').expect("chunks carry a payload");
+            assert!(data.len() <= CHARS_PER_CHUNK, "chunk exceeds 4096 chars");
+            header.get_or_insert_with(|| keys.to_owned());
+            payload.extend(base64_simd::STANDARD.decode_to_vec(data).unwrap());
+        }
+        (header.expect("at least one chunk"), payload)
+    }
+
+    #[test]
+    fn small_payloads_stay_raw_and_large_payloads_compress_losslessly() {
+        use std::io::Read;
+
+        let small = RgbaImage::from_fn(256, 256, |x, y| Rgba([x as u8, y as u8, 7, 255]));
+        let small_raw = small.as_raw().clone();
+        assert!(small_raw.len() < COMPRESSION_THRESHOLD_BYTES);
+        let (header, payload) = decode_transmission(&transmit_virtual(
+            DynamicImage::ImageRgba8(small),
+            Size::new(8, 4),
+            7,
+            false,
+        ));
+        assert!(!header.contains("o=z"), "{header}");
+        assert_eq!(payload, small_raw);
+
+        let large = RgbaImage::from_fn(640, 480, |x, y| {
+            Rgba([(x / 4) as u8, (y / 4) as u8, ((x ^ y) & 15) as u8, 255])
+        });
+        let large_raw = large.as_raw().clone();
+        assert!(large_raw.len() >= COMPRESSION_THRESHOLD_BYTES);
+        let command =
+            transmit_virtual(DynamicImage::ImageRgba8(large), Size::new(64, 24), 8, false);
+        let (header, payload) = decode_transmission(&command);
+        assert!(header.contains(",o=z,"), "{header}");
+        assert!(header.contains("s=640,v=480,"), "{header}");
+        assert!(payload.len() < large_raw.len());
+        let mut inflated = Vec::new();
+        flate2::read::ZlibDecoder::new(payload.as_slice())
+            .read_to_end(&mut inflated)
+            .unwrap();
+        assert_eq!(inflated, large_raw);
+    }
+
+    #[test]
+    fn incompressible_payloads_fall_back_to_raw_transmission() {
+        let mut state = 0x9E37_79B9_u32;
+        let mut noise = vec![0_u8; COMPRESSION_THRESHOLD_BYTES];
+        for byte in &mut noise {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        let (payload, compressed) = compress_payload(noise.clone());
+        assert!(!compressed);
+        assert_eq!(payload, noise);
     }
 
     #[test]

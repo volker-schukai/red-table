@@ -1,13 +1,14 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     mem::size_of,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use image::{DynamicImage, imageops::FilterType};
@@ -29,6 +30,9 @@ const MAX_CACHE_ENTRIES: usize = 256;
 const MAX_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_RAW_THUMBNAIL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PENDING_REQUESTS: usize = 64;
+/// Backoff before a failed key may be requested again; after the last entry
+/// the failure is permanent until the key identity changes.
+const FAILURE_BACKOFF: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(8)];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ThumbnailKey {
@@ -80,7 +84,7 @@ impl PreparedThumbnail {
 
 struct Request {
     key: ThumbnailKey,
-    path: PathBuf,
+    path: Arc<Path>,
     generation: u64,
 }
 
@@ -94,6 +98,18 @@ struct PreparedProtocol {
     disk_hit: bool,
 }
 
+struct Failure {
+    message: String,
+    attempts: u8,
+    retry_at: Option<Instant>,
+}
+
+impl Failure {
+    fn may_retry(&self, now: Instant) -> bool {
+        self.retry_at.is_some_and(|retry_at| now >= retry_at)
+    }
+}
+
 pub(crate) struct Thumbnails {
     request_sender: mpsc::SyncSender<Request>,
     response_receiver: mpsc::Receiver<Response>,
@@ -104,7 +120,8 @@ pub(crate) struct Thumbnails {
     cache_byte_limit: u64,
     visible: HashSet<ThumbnailKey>,
     pending: HashSet<ThumbnailKey>,
-    failed: HashMap<ThumbnailKey, String>,
+    deferred: HashSet<ThumbnailKey>,
+    failed: HashMap<ThumbnailKey, Failure>,
     failure_order: VecDeque<ThumbnailKey>,
     generation: Arc<AtomicU64>,
     persistent_hits: usize,
@@ -119,7 +136,13 @@ impl Thumbnails {
     }
 
     pub(crate) fn with_session(picker: Picker, kitty_session: KittySession) -> Self {
-        Self::with_limits(picker, kitty_session, MAX_CACHE_ENTRIES, MAX_CACHE_BYTES)
+        Self::with_limits(
+            picker,
+            kitty_session,
+            MAX_CACHE_ENTRIES,
+            MAX_CACHE_BYTES,
+            MAX_PENDING_REQUESTS,
+        )
     }
 
     fn with_limits(
@@ -127,11 +150,12 @@ impl Thumbnails {
         kitty_session: KittySession,
         cache_entry_limit: usize,
         cache_byte_limit: u64,
+        request_capacity: usize,
     ) -> Self {
         let worker_count = thread::available_parallelism()
             .map(|count| count.get().saturating_sub(1).clamp(1, 8))
             .unwrap_or(1);
-        let (request_sender, request_receiver) = mpsc::sync_channel(MAX_PENDING_REQUESTS);
+        let (request_sender, request_receiver) = mpsc::sync_channel(request_capacity);
         let (response_sender, response_receiver) = mpsc::sync_channel(worker_count * 2);
         let request_receiver = Arc::new(Mutex::new(request_receiver));
         let generation = Arc::new(AtomicU64::new(0));
@@ -170,6 +194,7 @@ impl Thumbnails {
             cache_byte_limit,
             visible: HashSet::new(),
             pending: HashSet::new(),
+            deferred: HashSet::new(),
             failed: HashMap::new(),
             failure_order: VecDeque::new(),
             generation,
@@ -184,7 +209,7 @@ impl Thumbnails {
             Some(key)
         } else if self.failed.contains_key(&key) {
             None
-        } else if self.pending.contains(&key) {
+        } else if self.pending.contains(&key) || self.deferred.contains(&key) {
             self.compatible_key(key)
         } else {
             None
@@ -199,8 +224,8 @@ impl Thumbnails {
         }
         self.failed
             .get(&key)
-            .map_or(ThumbnailDisplay::Loading, |error| {
-                ThumbnailDisplay::Error(error)
+            .map_or(ThumbnailDisplay::Loading, |failure| {
+                ThumbnailDisplay::Error(&failure.message)
             })
     }
 
@@ -216,16 +241,30 @@ impl Thumbnails {
         self.cache.get(&ready_key)
     }
 
-    pub(crate) fn begin_generation(&self) -> u64 {
+    pub(crate) fn begin_generation(&mut self) -> u64 {
+        self.deferred.clear();
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    pub(crate) fn request(&mut self, key: ThumbnailKey, path: PathBuf, generation: u64) -> bool {
+    pub(crate) fn request(&mut self, key: ThumbnailKey, path: Arc<Path>, generation: u64) -> bool {
+        self.request_at(key, path, generation, Instant::now())
+    }
+
+    fn request_at(
+        &mut self,
+        key: ThumbnailKey,
+        path: Arc<Path>,
+        generation: u64,
+        now: Instant,
+    ) -> bool {
         if key.size.width == 0
             || key.size.height == 0
             || self.cache.contains_key(&key)
             || self.pending.contains(&key)
-            || self.failed.contains_key(&key)
+            || self
+                .failed
+                .get(&key)
+                .is_some_and(|failure| !failure.may_retry(now))
         {
             return false;
         }
@@ -241,10 +280,14 @@ impl Thumbnails {
             generation,
         }) {
             Ok(()) => {
+                self.deferred.remove(&key);
                 self.pending.insert(key);
                 true
             }
-            Err(mpsc::TrySendError::Full(_)) => false,
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.deferred.insert(key);
+                false
+            }
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 self.response_closed = true;
                 self.insert_failure(key, "thumbnail workers are unavailable".into());
@@ -344,7 +387,7 @@ impl Thumbnails {
         self.insertion_order.push_back(key);
     }
 
-    fn insert(&mut self, key: ThumbnailKey, protocol: PreparedThumbnail) {
+    pub(crate) fn insert(&mut self, key: ThumbnailKey, protocol: PreparedThumbnail) {
         let resident_bytes = protocol.resident_bytes();
         if resident_bytes > self.cache_byte_limit {
             self.insert_failure(
@@ -380,8 +423,14 @@ impl Thumbnails {
     }
 
     fn insert_failure(&mut self, key: ThumbnailKey, error: String) {
+        self.insert_failure_at(key, error, Instant::now());
+    }
+
+    fn insert_failure_at(&mut self, key: ThumbnailKey, error: String, now: Instant) {
         if let Some(existing) = self.failed.get_mut(&key) {
-            *existing = error;
+            existing.attempts = existing.attempts.saturating_add(1);
+            existing.retry_at = retry_deadline(existing.attempts, now);
+            existing.message = error;
             return;
         }
         while self.failed.len() >= self.cache_entry_limit {
@@ -390,8 +439,28 @@ impl Thumbnails {
             };
             self.failed.remove(&oldest);
         }
-        self.failed.insert(key, error);
+        self.failed.insert(
+            key,
+            Failure {
+                message: error,
+                attempts: 1,
+                retry_at: retry_deadline(1, now),
+            },
+        );
         self.failure_order.push_back(key);
+    }
+}
+
+fn retry_deadline(attempts: u8, now: Instant) -> Option<Instant> {
+    FAILURE_BACKOFF
+        .get(usize::from(attempts.saturating_sub(1)))
+        .map(|backoff| now + *backoff)
+}
+
+#[cfg(test)]
+impl Thumbnails {
+    fn failure_attempts(&self, key: ThumbnailKey) -> Option<u8> {
+        self.failed.get(&key).map(|failure| failure.attempts)
     }
 }
 
@@ -636,7 +705,7 @@ mod tests {
 
     use super::*;
 
-    fn temporary_path(extension: &str) -> PathBuf {
+    fn temporary_path(extension: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -704,7 +773,7 @@ mod tests {
         };
         let mut thumbnails = Thumbnails::new(Picker::halfblocks());
         let generation = thumbnails.begin_generation();
-        assert!(thumbnails.request(key, path.clone(), generation));
+        assert!(thumbnails.request(key, Arc::from(path.clone()), generation));
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             thumbnails.drain();
@@ -945,6 +1014,157 @@ mod tests {
     }
 
     #[test]
+    fn failures_retry_after_backoff_and_become_permanent_after_three_attempts() {
+        let (request_sender, _request_receiver) = mpsc::sync_channel(8);
+        let (_response_sender, response_receiver) = mpsc::sync_channel(8);
+        let mut thumbnails = Thumbnails {
+            request_sender,
+            response_receiver,
+            cache: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            cache_bytes: 0,
+            cache_entry_limit: MAX_CACHE_ENTRIES,
+            cache_byte_limit: MAX_CACHE_BYTES,
+            visible: HashSet::new(),
+            pending: HashSet::new(),
+            deferred: HashSet::new(),
+            failed: HashMap::new(),
+            failure_order: VecDeque::new(),
+            generation: Arc::new(AtomicU64::new(0)),
+            persistent_hits: 0,
+            persistent_misses: 0,
+            response_closed: false,
+        };
+        let key = ThumbnailKey {
+            entry_id: EntryId(3),
+            revision: SourceRevision::default(),
+            size: Size::new(4, 2),
+            quality: "7".parse().unwrap(),
+        };
+        let start = Instant::now();
+        let request = |thumbnails: &mut Thumbnails, now| {
+            thumbnails.request_at(key, Arc::from(Path::new("broken.png")), 1, now)
+        };
+
+        thumbnails.insert_failure_at(key, "first".into(), start);
+        assert!(!request(
+            &mut thumbnails,
+            start + Duration::from_millis(1999)
+        ));
+        assert!(matches!(
+            thumbnails.display(key),
+            ThumbnailDisplay::Error("first")
+        ));
+        assert!(request(&mut thumbnails, start + Duration::from_secs(2)));
+        assert!(matches!(
+            thumbnails.display(key),
+            ThumbnailDisplay::Error("first")
+        ));
+        assert!(!request(&mut thumbnails, start + Duration::from_secs(3)));
+
+        thumbnails.pending.remove(&key);
+        thumbnails.insert_failure_at(key, "second".into(), start + Duration::from_secs(3));
+        assert_eq!(thumbnails.failure_attempts(key), Some(2));
+        assert!(!request(&mut thumbnails, start + Duration::from_secs(10)));
+        assert!(request(&mut thumbnails, start + Duration::from_secs(11)));
+
+        thumbnails.pending.remove(&key);
+        thumbnails.insert_failure_at(key, "third".into(), start + Duration::from_secs(11));
+        assert_eq!(thumbnails.failure_attempts(key), Some(3));
+        assert!(!request(
+            &mut thumbnails,
+            start + Duration::from_secs(10_000)
+        ));
+        assert!(matches!(
+            thumbnails.display(key),
+            ThumbnailDisplay::Error("third")
+        ));
+
+        let prepared = Halfblocks::new(
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 4, Rgb([20, 80, 160]))),
+            Size::new(4, 2),
+        )
+        .map(Protocol::Halfblocks)
+        .map(PreparedThumbnail::Standard)
+        .unwrap();
+        thumbnails.insert(key, prepared);
+        assert_eq!(thumbnails.failure_attempts(key), None);
+        assert!(matches!(
+            thumbnails.display(key),
+            ThumbnailDisplay::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn deferred_requests_keep_the_older_quality_until_a_new_generation() {
+        let (request_sender, _request_receiver) = mpsc::sync_channel(1);
+        let (_response_sender, response_receiver) = mpsc::sync_channel(1);
+        let mut thumbnails = Thumbnails {
+            request_sender,
+            response_receiver,
+            cache: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            cache_bytes: 0,
+            cache_entry_limit: MAX_CACHE_ENTRIES,
+            cache_byte_limit: MAX_CACHE_BYTES,
+            visible: HashSet::new(),
+            pending: HashSet::new(),
+            deferred: HashSet::new(),
+            failed: HashMap::new(),
+            failure_order: VecDeque::new(),
+            generation: Arc::new(AtomicU64::new(0)),
+            persistent_hits: 0,
+            persistent_misses: 0,
+            response_closed: false,
+        };
+        let low = |entry_id| ThumbnailKey {
+            entry_id: EntryId(entry_id),
+            revision: SourceRevision::default(),
+            size: Size::new(4, 2),
+            quality: "1".parse().unwrap(),
+        };
+        let high = |entry_id| ThumbnailKey {
+            quality: "9".parse().unwrap(),
+            ..low(entry_id)
+        };
+        let prepared = || {
+            Halfblocks::new(
+                DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 4, Rgb([20, 80, 160]))),
+                Size::new(4, 2),
+            )
+            .map(Protocol::Halfblocks)
+            .map(PreparedThumbnail::Standard)
+            .unwrap()
+        };
+        thumbnails.insert(low(1), prepared());
+        thumbnails.insert(low(2), prepared());
+        let generation = thumbnails.begin_generation();
+
+        assert!(thumbnails.request(high(1), Arc::from(Path::new("one.png")), generation));
+        assert!(!thumbnails.request(high(2), Arc::from(Path::new("two.png")), generation));
+        assert!(thumbnails.pending.contains(&high(1)));
+        assert!(thumbnails.deferred.contains(&high(2)));
+        assert!(matches!(
+            thumbnails.display(high(2)),
+            ThumbnailDisplay::Ready(_)
+        ));
+
+        let generation = thumbnails.begin_generation();
+        assert!(thumbnails.deferred.is_empty());
+        assert!(matches!(
+            thumbnails.display(high(2)),
+            ThumbnailDisplay::Loading
+        ));
+        assert!(!thumbnails.request(high(2), Arc::from(Path::new("two.png")), generation));
+        assert!(thumbnails.deferred.contains(&high(2)));
+        thumbnails.insert_failure(high(2), "decode failed".into());
+        assert!(matches!(
+            thumbnails.display(high(2)),
+            ThumbnailDisplay::Error("decode failed")
+        ));
+    }
+
+    #[test]
     fn prepared_cache_evicts_by_bytes_and_rejects_oversized_entries() {
         let key = |entry_id| ThumbnailKey {
             entry_id: EntryId(entry_id),
@@ -967,6 +1187,7 @@ mod tests {
             KittySession::with_tmux(false),
             10,
             one_entry_bytes,
+            MAX_PENDING_REQUESTS,
         );
         thumbnails.insert(key(1), prepared());
         thumbnails.insert(key(2), prepared());
@@ -979,6 +1200,7 @@ mod tests {
             KittySession::with_tmux(false),
             10,
             one_entry_bytes - 1,
+            MAX_PENDING_REQUESTS,
         );
         too_small.insert(key(3), prepared());
         assert_eq!(too_small.cache_stats(), (0, 0));
@@ -986,13 +1208,14 @@ mod tests {
             too_small.display(key(3)),
             ThumbnailDisplay::Error(error) if error.contains("memory limit")
         ));
-        assert!(!too_small.request(key(3), "unused.png".into(), 0));
+        assert!(!too_small.request(key(3), Arc::from(Path::new("unused.png")), 0));
 
         let mut lru = Thumbnails::with_limits(
             Picker::halfblocks(),
             KittySession::with_tmux(false),
             2,
             one_entry_bytes * 3,
+            MAX_PENDING_REQUESTS,
         );
         lru.insert(key(1), prepared());
         lru.insert(key(2), prepared());

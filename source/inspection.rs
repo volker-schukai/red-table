@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -138,7 +138,7 @@ pub(crate) struct InspectionKey {
 
 struct Request {
     key: InspectionKey,
-    path: PathBuf,
+    path: Arc<Path>,
     generation: u64,
 }
 
@@ -160,10 +160,17 @@ pub(crate) struct Inspection {
     generation: Arc<AtomicU64>,
     schedule_gate: Arc<Mutex<()>>,
     desired: Option<InspectionKey>,
-    ready: Option<(InspectionKey, PreparedThumbnail)>,
+    ready: Option<ReadyFrame>,
     error: Option<(InspectionKey, String)>,
-    visible: Option<InspectionKey>,
+    visible_frame: Option<u64>,
+    next_frame_id: u64,
     response_closed: bool,
+}
+
+struct ReadyFrame {
+    key: InspectionKey,
+    id: u64,
+    prepared: PreparedThumbnail,
 }
 
 #[derive(Clone)]
@@ -218,12 +225,13 @@ impl Inspection {
             desired: None,
             ready: None,
             error: None,
-            visible: None,
+            visible_frame: None,
+            next_frame_id: 0,
             response_closed: false,
         }
     }
 
-    pub(crate) fn request(&mut self, key: InspectionKey, path: PathBuf) -> bool {
+    pub(crate) fn request(&mut self, key: InspectionKey, path: Arc<Path>) -> bool {
         if key.size.width == 0 || key.size.height == 0 || self.desired == Some(key) {
             return false;
         }
@@ -272,7 +280,7 @@ impl Inspection {
                     }
                     match response.prepared {
                         Some(Ok(prepared)) => {
-                            self.ready = Some((response.key, prepared));
+                            self.store_ready(response.key, prepared);
                             self.error = None;
                         }
                         Some(Err(error)) => {
@@ -300,11 +308,36 @@ impl Inspection {
         changed
     }
 
-    pub(crate) fn display(&self, key: InspectionKey) -> InspectionDisplay<'_> {
-        if let Some((ready_key, prepared)) = self.ready.as_ref()
-            && *ready_key == key
+    fn store_ready(&mut self, key: InspectionKey, prepared: PreparedThumbnail) {
+        let id = self.next_frame_id;
+        self.next_frame_id += 1;
+        self.ready = Some(ReadyFrame { key, id, prepared });
+    }
+
+    /// Resolves the frame shown for `key`: the exact result, or, while the
+    /// exact key is still pending, the last ready frame of the same source
+    /// An exact error always wins over the fallback.
+    fn displayed_frame(&self, key: InspectionKey) -> Option<&ReadyFrame> {
+        let frame = self.ready.as_ref()?;
+        if frame.key == key {
+            return Some(frame);
+        }
+        if self
+            .error
+            .as_ref()
+            .is_some_and(|(error_key, _)| *error_key == key)
         {
-            return InspectionDisplay::Ready(prepared);
+            return None;
+        }
+        let pending_same_source = self.desired == Some(key)
+            && frame.key.entry_id == key.entry_id
+            && frame.key.revision == key.revision;
+        pending_same_source.then_some(frame)
+    }
+
+    pub(crate) fn display(&self, key: InspectionKey) -> InspectionDisplay<'_> {
+        if let Some(frame) = self.displayed_frame(key) {
+            return InspectionDisplay::Ready(&frame.prepared);
         }
         if let Some((error_key, error)) = self.error.as_ref()
             && *error_key == key
@@ -314,16 +347,22 @@ impl Inspection {
         InspectionDisplay::Loading
     }
 
-    pub(crate) fn update_visible(&mut self, key: Option<InspectionKey>) -> bool {
-        let changed = self.visible != key;
-        let rearmed = changed
-            && key.is_some_and(|key| {
-                self.ready
+    pub(crate) fn is_pending(&self) -> bool {
+        self.desired.is_some_and(|key| {
+            self.ready.as_ref().is_none_or(|frame| frame.key != key)
+                && self
+                    .error
                     .as_ref()
-                    .filter(|(ready_key, _)| *ready_key == key)
-                    .is_some_and(|(_, prepared)| prepared.rearm())
-            });
-        self.visible = key;
+                    .is_none_or(|(error_key, _)| *error_key != key)
+        })
+    }
+
+    pub(crate) fn update_visible(&mut self, key: Option<InspectionKey>) -> bool {
+        let displayed = key.and_then(|key| self.displayed_frame(key));
+        let displayed_id = displayed.map(|frame| frame.id);
+        let rearmed = displayed_id != self.visible_frame
+            && displayed.is_some_and(|frame| frame.prepared.rearm());
+        self.visible_frame = displayed_id;
         rearmed
     }
 }
@@ -483,7 +522,12 @@ fn prepare_view_with_session(
     }
     let mut canvas = background(target_width, target_height, key.background);
     let rendered = match key.zoom {
-        Zoom::Fit => source.resize(target_width, target_height, FilterType::Lanczos3),
+        Zoom::Fit => crate::image_source::downscale(
+            source,
+            target_width,
+            target_height,
+            FilterType::Lanczos3,
+        ),
         Zoom::Percent(percent) => {
             let geometry = crop_geometry(
                 source.width(),
@@ -505,7 +549,7 @@ fn prepare_view_with_session(
     };
     let x = i64::from(target_width.saturating_sub(rendered.width()) / 2);
     let y = i64::from(target_height.saturating_sub(rendered.height()) / 2);
-    image::imageops::overlay(&mut canvas, &rendered.to_rgba8(), x, y);
+    image::imageops::overlay(&mut canvas, &rendered.into_rgba8(), x, y);
     encode_exact(
         picker,
         DynamicImage::ImageRgba8(canvas),
@@ -733,10 +777,11 @@ mod tests {
         );
         let mut inspection =
             Inspection::new(Picker::halfblocks(), DecodedSources::new(64 * 1024 * 1024));
-        inspection.ready = Some((key, prepared));
+        inspection.store_ready(key, prepared);
         assert!(!inspection.update_visible(Some(key)));
 
-        let (_, PreparedThumbnail::Kitty(protocol)) = inspection.ready.as_ref().unwrap() else {
+        let PreparedThumbnail::Kitty(protocol) = &inspection.ready.as_ref().unwrap().prepared
+        else {
             panic!("test inserted a Kitty protocol");
         };
         let mut terminal = Terminal::new(TestBackend::new(1, 1)).unwrap();
@@ -746,6 +791,154 @@ mod tests {
         assert!(!inspection.update_visible(Some(key)));
         assert!(!inspection.update_visible(None));
         assert!(inspection.update_visible(Some(key)));
+    }
+
+    fn detached_inspection() -> (
+        Inspection,
+        mpsc::Receiver<Request>,
+        mpsc::SyncSender<Response>,
+    ) {
+        let (request_sender, request_receiver) = mpsc::sync_channel(16);
+        let (response_sender, response_receiver) = mpsc::sync_channel(16);
+        let inspection = Inspection {
+            request_sender,
+            response_receiver,
+            generation: Arc::new(AtomicU64::new(0)),
+            schedule_gate: Arc::new(Mutex::new(())),
+            desired: None,
+            ready: None,
+            error: None,
+            visible_frame: None,
+            next_frame_id: 0,
+            response_closed: false,
+        };
+        (inspection, request_receiver, response_sender)
+    }
+
+    fn halfblock_frame() -> PreparedThumbnail {
+        prepare_view(
+            &Picker::halfblocks(),
+            &DynamicImage::new_rgb8(2, 2),
+            InspectionKey {
+                entry_id: EntryId(1),
+                revision: SourceRevision::default(),
+                size: Size::new(2, 1),
+                zoom: Zoom::Fit,
+                center_x: CENTER,
+                center_y: CENTER,
+                background: BackgroundMode::Dark,
+                quality: "7".parse().unwrap(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pending_same_source_keys_keep_showing_the_last_ready_frame() {
+        let (mut inspection, _requests, _responses) = detached_inspection();
+        let fit = InspectionKey {
+            entry_id: EntryId(1),
+            revision: SourceRevision::default(),
+            size: Size::new(8, 4),
+            zoom: Zoom::Fit,
+            center_x: CENTER,
+            center_y: CENTER,
+            background: BackgroundMode::Dark,
+            quality: "7".parse().unwrap(),
+        };
+        inspection.desired = Some(fit);
+        inspection.store_ready(fit, halfblock_frame());
+        let shown = |inspection: &Inspection, key| match inspection.display(key) {
+            InspectionDisplay::Ready(prepared) => Some(prepared as *const PreparedThumbnail),
+            _ => None,
+        };
+        let exact = shown(&inspection, fit).unwrap();
+
+        let panned = InspectionKey {
+            zoom: Zoom::Percent(200),
+            center_x: CENTER + PAN_STEP,
+            ..fit
+        };
+        assert!(inspection.request(panned, Arc::from(Path::new("image.png"))));
+        assert!(inspection.is_pending());
+        assert_eq!(shown(&inspection, panned), Some(exact));
+        let recolored = InspectionKey {
+            background: BackgroundMode::Light,
+            ..panned
+        };
+        assert!(inspection.request(recolored, Arc::from(Path::new("image.png"))));
+        assert_eq!(shown(&inspection, recolored), Some(exact));
+
+        let other_image = InspectionKey {
+            entry_id: EntryId(2),
+            ..fit
+        };
+        assert!(inspection.request(other_image, Arc::from(Path::new("other.png"))));
+        assert!(matches!(
+            inspection.display(other_image),
+            InspectionDisplay::Loading
+        ));
+
+        let changed_revision = InspectionKey {
+            revision: SourceRevision {
+                size: 1,
+                modified_nanoseconds: 1,
+            },
+            ..fit
+        };
+        assert!(inspection.request(changed_revision, Arc::from(Path::new("image.png"))));
+        assert!(matches!(
+            inspection.display(changed_revision),
+            InspectionDisplay::Loading
+        ));
+
+        assert!(inspection.request(panned, Arc::from(Path::new("image.png"))));
+        inspection.error = Some((panned, "decode failed".into()));
+        assert!(matches!(
+            inspection.display(panned),
+            InspectionDisplay::Error("decode failed")
+        ));
+        assert!(!inspection.is_pending());
+    }
+
+    #[test]
+    fn fallback_frame_is_not_rearmed_while_it_stays_on_screen() {
+        let (mut inspection, _requests, _responses) = detached_inspection();
+        let fit = InspectionKey {
+            entry_id: EntryId(1),
+            revision: SourceRevision::default(),
+            size: Size::new(1, 1),
+            zoom: Zoom::Fit,
+            center_x: CENTER,
+            center_y: CENTER,
+            background: BackgroundMode::Dark,
+            quality: "7".parse().unwrap(),
+        };
+        let session = KittySession::with_tmux(false);
+        let prepared = PreparedThumbnail::Kitty(
+            KittyProtocol::new(DynamicImage::new_rgba8(1, 1), Size::new(1, 1), session).unwrap(),
+        );
+        inspection.desired = Some(fit);
+        inspection.store_ready(fit, prepared);
+        assert!(!inspection.update_visible(Some(fit)));
+        let PreparedThumbnail::Kitty(protocol) = &inspection.ready.as_ref().unwrap().prepared
+        else {
+            panic!("test inserted a Kitty protocol");
+        };
+        let mut terminal = Terminal::new(TestBackend::new(1, 1)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(KittyImage::new(protocol), frame.area()))
+            .unwrap();
+
+        let panned = InspectionKey {
+            zoom: Zoom::Percent(100),
+            ..fit
+        };
+        assert!(inspection.request(panned, Arc::from(Path::new("image.png"))));
+        assert!(!inspection.update_visible(Some(panned)));
+        assert!(!inspection.update_visible(Some(panned)));
+        assert!(!inspection.update_visible(None));
+        assert!(inspection.update_visible(Some(panned)));
     }
 
     #[test]
@@ -761,7 +954,8 @@ mod tests {
             desired: None,
             ready: None,
             error: None,
-            visible: None,
+            visible_frame: None,
+            next_frame_id: 0,
             response_closed: false,
         };
         let key = |entry_id| InspectionKey {
@@ -775,8 +969,8 @@ mod tests {
             quality: "7".parse().unwrap(),
         };
 
-        assert!(inspection.request(key(1), "first.png".into()));
-        assert!(!inspection.request(key(2), "second.png".into()));
+        assert!(inspection.request(key(1), Arc::from(Path::new("first.png"))));
+        assert!(!inspection.request(key(2), Arc::from(Path::new("second.png"))));
         assert_eq!(generation.load(Ordering::Acquire), 1);
         assert_eq!(inspection.desired, Some(key(1)));
         let accepted = request_receiver.try_recv().unwrap();
@@ -807,11 +1001,12 @@ mod tests {
             desired: None,
             ready: None,
             error: None,
-            visible: None,
+            visible_frame: None,
+            next_frame_id: 0,
             response_closed: false,
         };
 
-        assert!(inspection.request(key, "image.png".into()));
+        assert!(inspection.request(key, Arc::from(Path::new("image.png"))));
         let InspectionDisplay::Error(error) = inspection.display(key) else {
             panic!("disconnected worker must be visible as an error");
         };
@@ -844,7 +1039,7 @@ mod tests {
         };
         let mut inspection =
             Inspection::new(Picker::halfblocks(), DecodedSources::new(64 * 1024 * 1024));
-        assert!(inspection.request(key, path.clone()));
+        assert!(inspection.request(key, Arc::from(path.clone())));
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             inspection.drain();
@@ -886,8 +1081,8 @@ mod tests {
         let sources = DecodedSources::new(64 * 1024 * 1024);
         let mut left = Inspection::new(Picker::halfblocks(), sources.clone());
         let mut right = Inspection::new(Picker::halfblocks(), sources);
-        assert!(left.request(key(1), valid_path));
-        assert!(right.request(key(2), corrupt_path));
+        assert!(left.request(key(1), Arc::from(valid_path)));
+        assert!(right.request(key(2), Arc::from(corrupt_path)));
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             left.drain();

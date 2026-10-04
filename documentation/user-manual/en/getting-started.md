@@ -15,6 +15,10 @@ nix run . -- --thumbnail-size 40x18 /path/to/photos
 Accepted sizes range from `12x6` to `120x60`. They are target cell dimensions;
 the grid distributes remaining terminal space evenly.
 
+Directory scans show images in byte-wise ascending order of their path relative
+to the scanned directory, the order `ls` uses. Images found later in a running
+scan are merged into that order. A `--files0-from` list keeps its input order.
+
 Quality defaults to `7`. Set a startup level from `1` (fast) to `9` (maximum
 detail enhancement) with:
 

@@ -13,8 +13,13 @@ fn main() {
     println!(
         "inspection preparation: {SOURCE_WIDTH}x{SOURCE_HEIGHT} -> {TARGET_WIDTH}x{TARGET_HEIGHT}, median of {SAMPLES}"
     );
-    measure("fit", || {
+    measure("fit direct Lanczos3", || {
         source.resize(TARGET_WIDTH, TARGET_HEIGHT, FilterType::Lanczos3)
+    });
+    measure("fit box prepass + Lanczos3", || {
+        source
+            .thumbnail(TARGET_WIDTH * 2, TARGET_HEIGHT * 2)
+            .resize(TARGET_WIDTH, TARGET_HEIGHT, FilterType::Lanczos3)
     });
     measure("100% centered crop", || {
         let x = (SOURCE_WIDTH - TARGET_WIDTH) / 2;

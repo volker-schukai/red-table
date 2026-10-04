@@ -1,4 +1,5 @@
 use std::{
+    io,
     path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
@@ -10,7 +11,7 @@ use ratatui_image::picker::Picker;
 use crate::{
     BoxError,
     actions::{Action, ActionContext, Bindings},
-    app::{App, EntryId, InputMode},
+    app::{App, EntryId, EntryOrder, InputMode},
     config::RuntimeSettings,
     graphics,
     inspection::{DecodedSources, Inspection, InspectionDisplay, InspectionKey, ViewState},
@@ -23,6 +24,9 @@ use crate::{
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// Poll interval while no scan, thumbnail, inspection, or cleanup work is
+/// pending; only input and resize events need to wake the loop.
+const IDLE_INTERVAL: Duration = Duration::from_millis(250);
 const PREFETCH_ROWS: usize = 1;
 
 pub(crate) enum BrowseOutcome {
@@ -47,17 +51,39 @@ pub(crate) fn run(
     let mut terminal = TerminalSession::new(TerminalTarget::for_result_mode(selection_mode))?;
     let (picker, protocol_name) =
         graphics::select_picker(settings.graphics_protocol, !selection_mode);
-    let result = Browser::new(
+    let kitty_session = KittySession::from_process();
+    let mut browser = Browser::new(
         root,
         picker,
         protocol_name,
         settings,
         selection_mode,
         input_paths,
-    )
-    .run(terminal.terminal_mut());
+        kitty_session.clone(),
+    );
+    let loop_result = browser.run(terminal.terminal_mut());
+    let close_result = close(
+        browser,
+        &kitty_session,
+        terminal.terminal_mut().backend_mut(),
+    );
     terminal.restore();
-    result
+    loop_result?;
+    Ok(close_result?)
+}
+
+/// Finishes the browser and releases every terminal-side image it still owns.
+///
+/// Dropping the browser queues deletions for all transmitted Kitty images, so
+/// the drain must run afterwards and before the terminal is restored.
+fn close(
+    browser: Browser,
+    kitty_session: &KittySession,
+    writer: &mut dyn io::Write,
+) -> io::Result<BrowseOutcome> {
+    let outcome = browser.finish();
+    kitty_session.drain_cleanup(writer)?;
+    Ok(outcome)
 }
 
 struct Browser {
@@ -153,9 +179,9 @@ impl Browser {
         settings: RuntimeSettings,
         selection_mode: bool,
         input_paths: Option<Vec<PathBuf>>,
+        kitty_session: KittySession,
     ) -> Self {
         let decoded_sources = DecodedSources::new(settings.decoded_cache_bytes);
-        let kitty_session = KittySession::from_process();
         let inspection = Inspection::with_session(
             picker.clone(),
             decoded_sources.clone(),
@@ -163,12 +189,17 @@ impl Browser {
         );
         let comparison_inspection =
             Inspection::with_session(picker.clone(), decoded_sources, kitty_session.clone());
+        let order = if input_paths.is_some() {
+            EntryOrder::Arrival
+        } else {
+            EntryOrder::Path
+        };
         Self {
             scanner: match input_paths {
                 Some(paths) => scan::start_paths(root.clone(), paths),
                 None => scan::start(root.clone()),
             },
-            app: App::new(root),
+            app: App::with_order(root, order),
             thumbnails: Thumbnails::with_session(picker, kitty_session.clone()),
             kitty_session,
             inspection,
@@ -203,7 +234,7 @@ impl Browser {
         }
     }
 
-    fn run(mut self, terminal: &mut AppTerminal) -> Result<BrowseOutcome, BoxError> {
+    fn run(&mut self, terminal: &mut AppTerminal) -> Result<(), BoxError> {
         let mut dirty = true;
         while self.running {
             let frame_started = Instant::now();
@@ -279,12 +310,13 @@ impl Browser {
                 dirty = self.schedule_work();
             }
 
-            let wait = FRAME_INTERVAL.saturating_sub(frame_started.elapsed());
+            let wait =
+                poll_interval(self.has_background_work()).saturating_sub(frame_started.elapsed());
             if event::poll(wait)? {
                 dirty |= self.handle_event(event::read()?);
             }
         }
-        Ok(self.finish())
+        Ok(())
     }
 
     fn finish(self) -> BrowseOutcome {
@@ -295,6 +327,14 @@ impl Browser {
         } else {
             BrowseOutcome::Completed
         }
+    }
+
+    fn has_background_work(&self) -> bool {
+        !self.app.scan_done
+            || self.thumbnails.pending_count() > 0
+            || self.inspection.is_pending()
+            || self.comparison_inspection.is_pending()
+            || self.kitty_session.has_pending_cleanup()
     }
 
     fn drain_background_work(&mut self) -> bool {
@@ -323,6 +363,7 @@ impl Browser {
                     }
                 }
             }
+            changed |= self.app.integrate_pending();
         }
         let (completed, errors) = self.thumbnails.drain();
         self.app.thumbnail_errors += errors;
@@ -415,7 +456,9 @@ impl Browser {
             self.view = BrowserView::Grid;
             return false;
         };
-        if candidate.id == state.reference_id || !self.app.filtered.contains(&state.reference_id) {
+        if candidate.id == state.reference_id
+            || self.app.filtered_position(state.reference_id).is_none()
+        {
             self.view = BrowserView::Grid;
             return false;
         }
@@ -765,7 +808,7 @@ impl Browser {
             return;
         };
         let candidate = self.app.filtered.get(self.app.selected).copied();
-        if !self.app.filtered.contains(&state.reference_id)
+        if self.app.filtered_position(state.reference_id).is_none()
             || candidate.is_none_or(|id| id == state.reference_id)
         {
             self.view = BrowserView::Grid;
@@ -788,6 +831,14 @@ impl Browser {
             }
             _ => {}
         }
+    }
+}
+
+const fn poll_interval(has_background_work: bool) -> Duration {
+    if has_background_work {
+        FRAME_INTERVAL
+    } else {
+        IDLE_INTERVAL
     }
 }
 
@@ -841,12 +892,14 @@ mod tests {
             settings,
             false,
             None,
+            KittySession::with_tmux(false),
         );
-        for name in ["one.png", "two.png", "three.png"] {
+        for name in ["1-one.png", "2-two.png", "3-three.png"] {
             browser
                 .app
                 .add_path(root.join(name), SourceRevision::default());
         }
+        browser.app.integrate_pending();
         browser.grid.columns = 2;
         browser.grid.rows = 1;
         (browser, root)
@@ -933,7 +986,7 @@ mod tests {
         let BrowseOutcome::Selection(paths) = confirmed.finish() else {
             panic!("confirmation must produce a selection");
         };
-        assert_eq!(paths, vec![confirmed_root.join("one.png")]);
+        assert_eq!(paths, vec![confirmed_root.join("1-one.png")]);
 
         let (mut cancelled, cancelled_root) = browser_with_images();
         cancelled.selection_mode = true;
@@ -1026,6 +1079,83 @@ mod tests {
         assert!(matches!(browser.view, BrowserView::Grid));
         assert_eq!(browser.app.selected_entry().unwrap().id, EntryId(1));
         assert_eq!(browser.app.marked_count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn closing_the_browser_deletes_only_transmitted_kitty_images() {
+        use image::DynamicImage;
+        use ratatui::{Terminal, backend::TestBackend, layout::Size};
+
+        use crate::{
+            kitty::{KittyImage, KittyProtocol},
+            thumbnails::{PreparedThumbnail, ThumbnailKey},
+        };
+
+        let (mut browser, root) = browser_with_images();
+        let session = browser.kitty_session.clone();
+        let key = |entry_id| ThumbnailKey {
+            entry_id: EntryId(entry_id),
+            revision: SourceRevision::default(),
+            size: Size::new(1, 1),
+            quality: "7".parse().unwrap(),
+        };
+        let transmitted = KittyProtocol::new(
+            DynamicImage::new_rgba8(1, 1),
+            Size::new(1, 1),
+            session.clone(),
+        )
+        .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(1, 1)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(KittyImage::new(&transmitted), frame.area()))
+            .unwrap();
+        let transmitted_id = transmitted.id();
+        browser
+            .thumbnails
+            .insert(key(0), PreparedThumbnail::Kitty(transmitted));
+        let never_sent = KittyProtocol::new(
+            DynamicImage::new_rgba8(1, 1),
+            Size::new(1, 1),
+            session.clone(),
+        )
+        .unwrap();
+        let never_sent_id = never_sent.id();
+        browser
+            .thumbnails
+            .insert(key(1), PreparedThumbnail::Kitty(never_sent));
+
+        let mut output = Vec::new();
+        assert!(matches!(
+            close(browser, &session, &mut output).unwrap(),
+            BrowseOutcome::Completed
+        ));
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("a=d,d=I,i=").count(), 1);
+        assert!(output.contains(&format!("a=d,d=I,i={transmitted_id}")));
+        assert!(!output.contains(&format!("i={never_sent_id}")));
+        assert!(!session.has_pending_cleanup());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn idle_loop_polls_slowly_only_without_background_work() {
+        assert_eq!(poll_interval(true), FRAME_INTERVAL);
+        assert_eq!(poll_interval(false), IDLE_INTERVAL);
+        assert!(IDLE_INTERVAL > FRAME_INTERVAL);
+
+        let (mut browser, root) = browser_with_images();
+        assert!(browser.has_background_work(), "the scan is still running");
+        browser.app.scan_done = true;
+        assert!(!browser.has_background_work());
+
+        browser.view = BrowserView::Inspect(ViewState::default());
+        browser.inspection_size = ratatui::layout::Size::new(8, 4);
+        assert!(browser.schedule_inspection(ViewState::default()));
+        assert!(
+            browser.has_background_work(),
+            "an inspection request is pending"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

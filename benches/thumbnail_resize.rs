@@ -49,6 +49,20 @@ fn main() {
         println!("{label}: {:.2?}", samples[SAMPLES / 2]);
     }
 
+    println!(
+        "two-stage class reduction: {SOURCE_WIDTH}x{SOURCE_HEIGHT} -> 512 and 128, median of {SAMPLES}"
+    );
+    for (label, class) in [("x-large 512", 512), ("normal 128", 128)] {
+        let direct = || source.resize(class, class, FilterType::Lanczos3);
+        let staged = || {
+            source
+                .thumbnail(class * 2, class * 2)
+                .resize(class, class, FilterType::Lanczos3)
+        };
+        println!("{label} direct Lanczos3: {:.2?}", median(direct));
+        println!("{label} box prepass + Lanczos3: {:.2?}", median(staged));
+    }
+
     let half_source =
         source.resize_exact(HALF_SOURCE_WIDTH, HALF_SOURCE_HEIGHT, FilterType::Lanczos3);
     println!(
@@ -81,6 +95,19 @@ fn main() {
         samples.sort_unstable();
         println!("{label}: {:.2?}", samples[SAMPLES / 2]);
     }
+}
+
+fn median(operation: impl Fn() -> DynamicImage) -> std::time::Duration {
+    let _ = operation();
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        let prepared = black_box(operation());
+        black_box(prepared.width());
+        samples.push(started.elapsed());
+    }
+    samples.sort_unstable();
+    samples[SAMPLES / 2]
 }
 
 fn resize(

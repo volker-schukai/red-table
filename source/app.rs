@@ -1,6 +1,8 @@
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9,11 +11,22 @@ pub(crate) enum InputMode {
     Search,
 }
 
+/// Display order of entries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EntryOrder {
+    /// Byte-wise ascending path order, the order directory scans use.
+    Path,
+    /// The order in which paths were added, used for explicit input lists.
+    Arrival,
+}
+
 #[derive(Debug)]
 pub(crate) struct ImageEntry {
     pub(crate) id: EntryId,
     pub(crate) revision: SourceRevision,
-    pub(crate) path: PathBuf,
+    /// Shared with `App::path_ids` and with background requests, so each path
+    /// is allocated once.
+    pub(crate) path: Arc<Path>,
     pub(crate) label: String,
     search_key: String,
 }
@@ -39,18 +52,26 @@ pub(crate) struct App {
     pub(crate) scan_done: bool,
     pub(crate) scan_errors: usize,
     pub(crate) thumbnail_errors: usize,
+    order: EntryOrder,
+    sorted: Vec<EntryId>,
+    pending_ids: Vec<EntryId>,
     marked: HashSet<EntryId>,
     mark_order: Vec<EntryId>,
     mark_anchor: Option<EntryId>,
     marked_only: bool,
     query_before_edit: String,
     entry_positions: HashMap<EntryId, usize>,
-    path_ids: HashMap<PathBuf, EntryId>,
+    path_ids: HashMap<Arc<Path>, EntryId>,
     next_entry_id: u64,
 }
 
 impl App {
+    #[cfg(test)]
     pub(crate) fn new(root: PathBuf) -> Self {
+        Self::with_order(root, EntryOrder::Path)
+    }
+
+    pub(crate) fn with_order(root: PathBuf, order: EntryOrder) -> Self {
         Self {
             root,
             entries: Vec::new(),
@@ -62,6 +83,9 @@ impl App {
             scan_done: false,
             scan_errors: 0,
             thumbnail_errors: 0,
+            order,
+            sorted: Vec::new(),
+            pending_ids: Vec::new(),
             marked: HashSet::new(),
             mark_order: Vec::new(),
             mark_anchor: None,
@@ -73,8 +97,10 @@ impl App {
         }
     }
 
+    /// Registers a path. New entries become visible only after the next
+    /// [`App::integrate_pending`], which merges them in display order.
     pub(crate) fn add_path(&mut self, path: PathBuf, revision: SourceRevision) -> EntryId {
-        if let Some(id) = self.path_ids.get(&path).copied() {
+        if let Some(id) = self.path_ids.get(path.as_path()).copied() {
             if let Some(entry) = self.entry_mut(id) {
                 entry.revision = revision;
             }
@@ -89,9 +115,9 @@ impl App {
             .to_string_lossy()
             .into_owned();
         let search_key = relative.to_string_lossy().to_lowercase();
-        let matches = !self.marked_only
-            && (self.query.is_empty() || search_key.contains(&self.query.to_lowercase()));
+        let path: Arc<Path> = Arc::from(path);
 
+        self.path_ids.insert(Arc::clone(&path), id);
         self.entries.push(ImageEntry {
             id,
             revision,
@@ -99,14 +125,34 @@ impl App {
             label,
             search_key,
         });
-        if matches {
-            self.filtered.push(id);
-        }
-        let position = self.entries.len() - 1;
-        self.entry_positions.insert(id, position);
-        self.path_ids
-            .insert(self.entries[position].path.clone(), id);
+        self.entry_positions.insert(id, self.entries.len() - 1);
+        self.pending_ids.push(id);
         id
+    }
+
+    /// Merges entries added since the last call into the display order and the
+    /// visible filter in linear time, preserving focus identity.
+    pub(crate) fn integrate_pending(&mut self) -> bool {
+        if self.pending_ids.is_empty() {
+            return false;
+        }
+        let mut batch = std::mem::take(&mut self.pending_ids);
+        batch.sort_unstable_by(|a, b| self.compare(*a, *b));
+        self.sorted = merge(&self.sorted, &batch, |a, b| self.compare(a, b));
+
+        let needle = self.query.to_lowercase();
+        let visible_batch = batch
+            .iter()
+            .copied()
+            .filter(|id| self.matches_filter(*id, &needle))
+            .collect::<Vec<_>>();
+        if visible_batch.is_empty() {
+            return true;
+        }
+        let selected_id = self.filtered.get(self.selected).copied();
+        self.filtered = merge(&self.filtered, &visible_batch, |a, b| self.compare(a, b));
+        self.restore_selection(selected_id, self.selected);
+        true
     }
 
     pub(crate) fn selected_entry(&self) -> Option<&ImageEntry> {
@@ -119,6 +165,15 @@ impl App {
         self.entry_positions
             .get(&id)
             .and_then(|position| self.entries.get(*position))
+    }
+
+    /// Position of `id` in the visible filter, found by binary search because
+    /// the filter is kept in display order.
+    pub(crate) fn filtered_position(&self, id: EntryId) -> Option<usize> {
+        self.filtered
+            .binary_search_by(|candidate| self.compare(*candidate, id))
+            .ok()
+            .filter(|position| self.filtered[*position] == id)
     }
 
     pub(crate) fn is_marked(&self, id: EntryId) -> bool {
@@ -137,7 +192,7 @@ impl App {
         self.mark_order
             .iter()
             .filter(|id| self.marked.contains(id))
-            .filter_map(|id| self.entry(*id).map(|entry| entry.path.clone()))
+            .filter_map(|id| self.entry(*id).map(|entry| entry.path.to_path_buf()))
             .collect()
     }
 
@@ -170,7 +225,7 @@ impl App {
         };
         let anchor = self
             .mark_anchor
-            .and_then(|id| self.filtered.iter().position(|candidate| *candidate == id))
+            .and_then(|id| self.filtered_position(id))
             .unwrap_or(self.selected);
         let (start, end) = if anchor <= self.selected {
             (anchor, self.selected)
@@ -308,27 +363,72 @@ impl App {
         self.filtered[start.min(end)..end].iter().copied()
     }
 
-    fn rebuild_filter(&mut self) {
-        let selected_id = self.filtered.get(self.selected).copied();
-        let old_position = self.selected;
-        let needle = self.query.to_lowercase();
-        self.filtered.clear();
-        self.filtered.extend(
-            self.entries
-                .iter()
-                .filter(|entry| {
-                    (needle.is_empty() || entry.search_key.contains(&needle))
-                        && (!self.marked_only || self.marked.contains(&entry.id))
-                })
-                .map(|entry| entry.id),
-        );
+    fn compare(&self, a: EntryId, b: EntryId) -> Ordering {
+        match self.order {
+            EntryOrder::Arrival => a.0.cmp(&b.0),
+            EntryOrder::Path => {
+                let path_bytes = |id| {
+                    self.entry(id)
+                        .map(|entry| entry.path.as_os_str().as_encoded_bytes())
+                };
+                path_bytes(a)
+                    .cmp(&path_bytes(b))
+                    .then_with(|| a.0.cmp(&b.0))
+            }
+        }
+    }
+
+    fn matches_filter(&self, id: EntryId, needle: &str) -> bool {
+        self.entry(id).is_some_and(|entry| {
+            (needle.is_empty() || entry.search_key.contains(needle))
+                && (!self.marked_only || self.marked.contains(&entry.id))
+        })
+    }
+
+    fn restore_selection(&mut self, selected_id: Option<EntryId>, old_position: usize) {
         self.selected = selected_id
-            .and_then(|id| self.filtered.iter().position(|candidate| *candidate == id))
+            .and_then(|id| self.filtered_position(id))
             .unwrap_or_else(|| old_position.min(self.filtered.len().saturating_sub(1)));
         if self.filtered.is_empty() {
             self.row_offset = 0;
         }
     }
+
+    fn rebuild_filter(&mut self) {
+        let selected_id = self.filtered.get(self.selected).copied();
+        let old_position = self.selected;
+        let needle = self.query.to_lowercase();
+        let filtered = self
+            .sorted
+            .iter()
+            .copied()
+            .filter(|id| self.matches_filter(*id, &needle))
+            .collect();
+        self.filtered = filtered;
+        self.restore_selection(selected_id, old_position);
+    }
+}
+
+/// Merges two sequences that are both ordered by `compare` into one.
+fn merge(
+    existing: &[EntryId],
+    batch: &[EntryId],
+    compare: impl Fn(EntryId, EntryId) -> Ordering,
+) -> Vec<EntryId> {
+    let mut merged = Vec::with_capacity(existing.len() + batch.len());
+    let (mut left, mut right) = (0, 0);
+    while left < existing.len() && right < batch.len() {
+        if compare(existing[left], batch[right]) == Ordering::Greater {
+            merged.push(batch[right]);
+            right += 1;
+        } else {
+            merged.push(existing[left]);
+            left += 1;
+        }
+    }
+    merged.extend_from_slice(&existing[left..]);
+    merged.extend_from_slice(&batch[right..]);
+    merged
 }
 
 pub(crate) fn is_supported_image(path: &Path) -> bool {
@@ -346,15 +446,27 @@ pub(crate) fn is_supported_image(path: &Path) -> bool {
 mod tests {
     use super::*;
 
-    fn app_with_images(names: &[&str]) -> App {
-        let mut app = App::new("/photos".into());
+    fn app_with_order(order: EntryOrder, names: &[&str]) -> App {
+        let mut app = App::with_order("/photos".into(), order);
         for name in names {
             app.add_path(
                 PathBuf::from("/photos").join(name),
                 SourceRevision::default(),
             );
         }
+        app.integrate_pending();
         app
+    }
+
+    fn app_with_images(names: &[&str]) -> App {
+        app_with_order(EntryOrder::Arrival, names)
+    }
+
+    fn visible_names(app: &App) -> Vec<&str> {
+        app.filtered
+            .iter()
+            .map(|id| app.entry(*id).unwrap().label.as_str())
+            .collect()
     }
 
     #[test]
@@ -428,6 +540,7 @@ mod tests {
             modified_nanoseconds: 9,
         };
         assert_eq!(app.add_path(PathBuf::from("/photos/two.jpg"), changed), id);
+        assert!(!app.integrate_pending());
         assert_eq!(app.entry(id).unwrap().revision, changed);
         assert_eq!(app.entries.len(), 2);
     }
@@ -496,5 +609,120 @@ mod tests {
                 PathBuf::from("/photos/one.jpg")
             ]
         );
+    }
+
+    #[test]
+    fn path_order_sorts_arrivals_bytewise_and_arrival_order_keeps_input_order() {
+        let names = ["b/2.jpg", "a/Z.jpg", "a/b.jpg", "10.jpg", "2.jpg"];
+        let sorted = app_with_order(EntryOrder::Path, &names);
+        assert_eq!(
+            visible_names(&sorted),
+            vec!["10.jpg", "2.jpg", "Z.jpg", "b.jpg", "2.jpg"]
+        );
+        assert_eq!(
+            sorted.filtered,
+            vec![EntryId(3), EntryId(4), EntryId(1), EntryId(2), EntryId(0)]
+        );
+        for (position, id) in sorted.filtered.iter().enumerate() {
+            assert_eq!(sorted.filtered_position(*id), Some(position));
+        }
+
+        let arrival = app_with_order(EntryOrder::Arrival, &names);
+        assert_eq!(arrival.filtered, (0..5).map(EntryId).collect::<Vec<_>>());
+        assert_eq!(arrival.filtered_position(EntryId(4)), Some(4));
+        assert_eq!(arrival.filtered_position(EntryId(9)), None);
+    }
+
+    #[test]
+    fn incremental_batches_merge_in_order_and_keep_focus_identity() {
+        let mut app = App::new("/photos".into());
+        for name in ["m.jpg", "c.jpg"] {
+            app.add_path(
+                PathBuf::from("/photos").join(name),
+                SourceRevision::default(),
+            );
+        }
+        assert!(
+            app.filtered.is_empty(),
+            "pending entries are not visible yet"
+        );
+        assert!(app.integrate_pending());
+        assert_eq!(visible_names(&app), vec!["c.jpg", "m.jpg"]);
+
+        app.selected = 1;
+        app.toggle_mark();
+        let focused = app.selected_entry().unwrap().id;
+        for name in ["a.jpg", "z.jpg", "d.jpg"] {
+            app.add_path(
+                PathBuf::from("/photos").join(name),
+                SourceRevision::default(),
+            );
+        }
+        assert!(app.integrate_pending());
+        assert!(!app.integrate_pending());
+        assert_eq!(
+            visible_names(&app),
+            vec!["a.jpg", "c.jpg", "d.jpg", "m.jpg", "z.jpg"]
+        );
+        assert_eq!(app.selected_entry().unwrap().id, focused);
+        assert_eq!(app.selected, 3);
+        assert!(app.is_marked(focused));
+        assert_eq!(app.marked_paths(), vec![PathBuf::from("/photos/m.jpg")]);
+    }
+
+    #[test]
+    fn search_and_selected_only_follow_path_order_during_integration() {
+        let mut app = App::new("/photos".into());
+        for name in ["trip/b.jpg", "home/a.jpg"] {
+            app.add_path(
+                PathBuf::from("/photos").join(name),
+                SourceRevision::default(),
+            );
+        }
+        app.integrate_pending();
+        app.start_search();
+        for character in "trip".chars() {
+            app.push_search(character);
+        }
+        app.commit_search();
+        assert_eq!(visible_names(&app), vec!["b.jpg"]);
+
+        for name in ["trip/a.jpg", "home/c.jpg", "trip/c.jpg"] {
+            app.add_path(
+                PathBuf::from("/photos").join(name),
+                SourceRevision::default(),
+            );
+        }
+        app.integrate_pending();
+        assert_eq!(visible_names(&app), vec!["a.jpg", "b.jpg", "c.jpg"]);
+        assert_eq!(app.selected_entry().unwrap().label, "b.jpg");
+
+        app.selected = 2;
+        app.toggle_mark();
+        app.toggle_marked_only();
+        assert_eq!(visible_names(&app), vec!["c.jpg"]);
+        app.add_path(
+            PathBuf::from("/photos/trip/d.jpg"),
+            SourceRevision::default(),
+        );
+        assert!(app.integrate_pending());
+        assert_eq!(visible_names(&app), vec!["c.jpg"]);
+        app.toggle_marked_only();
+        assert_eq!(
+            visible_names(&app),
+            vec!["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+        );
+    }
+
+    #[test]
+    fn merge_interleaves_two_ordered_sequences() {
+        let compare = |a: EntryId, b: EntryId| a.0.cmp(&b.0);
+        let ids = |values: &[u64]| values.iter().copied().map(EntryId).collect::<Vec<_>>();
+        assert_eq!(
+            merge(&ids(&[1, 4, 6]), &ids(&[0, 5, 9]), compare),
+            ids(&[0, 1, 4, 5, 6, 9])
+        );
+        assert_eq!(merge(&[], &ids(&[2, 3]), compare), ids(&[2, 3]));
+        assert_eq!(merge(&ids(&[2, 3]), &[], compare), ids(&[2, 3]));
     }
 }

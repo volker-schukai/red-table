@@ -16,6 +16,11 @@ nix run . -- --thumbnail-size 40x18 /pfad/zu/bildern
 Erlaubt sind `12x6` bis `120x60`. Es handelt sich um Zielwerte; das Raster
 verteilt den verbleibenden Platz gleichmäßig.
 
+Verzeichnis-Scans zeigen Bilder byteweise aufsteigend nach ihrem Pfad relativ
+zum gescannten Verzeichnis, also in der Reihenfolge von `ls`. Bilder, die ein
+laufender Scan später findet, werden in diese Reihenfolge einsortiert. Eine
+Liste über `--files0-from` behält ihre Eingabereihenfolge.
+
 Die Qualitätsstufe ist standardmäßig `7`. Beim Start kann sie von `1` (schnell)
 bis `9` (maximale Detailverstärkung) gesetzt werden:
 

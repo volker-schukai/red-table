@@ -738,6 +738,7 @@ mod tests {
     fn mark_label_is_literal_and_independent_from_focus_styling() {
         let mut app = App::new("/photos".into());
         let id = app.add_path("/photos/one.png".into(), SourceRevision::default());
+        app.integrate_pending();
         assert_eq!(grid_label(&app, app.entry(id).unwrap()), "[ ] one.png");
         app.toggle_mark();
         assert_eq!(grid_label(&app, app.entry(id).unwrap()), "[x] one.png");

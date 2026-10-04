@@ -1,6 +1,6 @@
 [package]
 name = "red-table"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A fast, keyboard-driven terminal image browser"
 license = "MIT"
@@ -48,6 +48,7 @@ strip = "symbols"
 [dependencies]
 base64-simd = "=0.8.0"
 crossterm = { version = "0.29.0", default-features = false, features = ["events"] }
+flate2 = "=1.1.10"
 ignore = "0.4.23"
 image = { version = "=0.25.9", default-features = false, features = ["jpeg", "png", "gif", "webp", "tiff", "bmp"] }
 md5 = "0.8.0"

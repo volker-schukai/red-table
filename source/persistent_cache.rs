@@ -211,7 +211,7 @@ fn resize_for_class(image: DynamicImage, class: CacheClass) -> DynamicImage {
     if image.width() <= dimension && image.height() <= dimension {
         image
     } else {
-        image.resize(dimension, dimension, FilterType::Lanczos3)
+        crate::image_source::downscale(&image, dimension, dimension, FilterType::Lanczos3)
     }
 }
 
@@ -364,18 +364,13 @@ fn write_cache(
             writer.finish().map_err(|error| error.to_string())?;
         }
         buffered.flush().map_err(|error| error.to_string())?;
-        buffered
-            .get_ref()
-            .sync_all()
-            .map_err(|error| error.to_string())?;
         drop(buffered);
+        // Publication is the atomic rename; the cache is regenerable, so no
+        // fsync is issued for the file or the directory.
         fs::rename(&temporary, &location.path).map_err(|error| error.to_string())?;
         #[cfg(unix)]
         fs::set_permissions(&location.path, fs::Permissions::from_mode(0o600))
             .map_err(|error| error.to_string())?;
-        if let Ok(directory) = File::open(&location.directory) {
-            let _ = directory.sync_all();
-        }
         Ok(())
     })();
 
@@ -583,6 +578,56 @@ mod tests {
         assert!(!regenerated.disk_hit);
         assert!(read_valid_cache(&location, &stamp).unwrap().is_some());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publication_reads_only_the_digest_path_and_leaves_no_temporaries() {
+        let directory = temporary_directory("publish");
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.png");
+        source_image(&source, 320, 240, [40, 90, 130]);
+        let cache = PersistentCache::with_root(directory.join("cache/thumbnails"));
+        let stamp = SourceStamp::read(&source).unwrap();
+        let location = cache_location(
+            cache.root.as_deref().unwrap(),
+            CacheClass::Normal,
+            &stamp.uri,
+        );
+        fs::create_dir_all(&location.directory).unwrap();
+        fs::write(
+            location.directory.join(".red-table-1-1.tmp"),
+            b"an interrupted writer left this behind",
+        )
+        .unwrap();
+
+        assert!(read_valid_cache(&location, &stamp).unwrap().is_none());
+        let prepared = cache.prepare(&source, (100, 80)).unwrap();
+        assert!(!prepared.disk_hit);
+        assert!(read_valid_cache(&location, &stamp).unwrap().is_some());
+        let names = fs::read_dir(&location.directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.iter().any(|name| name == ".red-table-1-1.tmp"));
+        assert!(names.iter().any(|name| name.ends_with(".png")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn two_stage_class_reduction_matches_direct_dimensions() {
+        let source = DynamicImage::ImageRgb8(RgbImage::from_fn(1600, 900, |x, y| {
+            Rgb([(x % 256) as u8, (y % 256) as u8, ((x ^ y) & 255) as u8])
+        }));
+        let reduced = resize_for_class(source.clone(), CacheClass::Normal);
+        assert_eq!((reduced.width(), reduced.height()), (128, 72));
+        let direct = source.resize(128, 128, FilterType::Lanczos3);
+        assert_eq!((direct.width(), direct.height()), (128, 72));
+        let small = resize_for_class(
+            source.resize(100, 100, FilterType::Triangle),
+            CacheClass::Normal,
+        );
+        assert_eq!((small.width(), small.height()), (100, 56));
     }
 
     #[test]

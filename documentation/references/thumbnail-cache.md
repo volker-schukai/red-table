@@ -47,8 +47,10 @@ conservatively regenerated.
 
 Source metadata is read before and after decode/resize. If it changes, the
 generated pixels are discarded and retried once. Cache files are written to a
-unique temporary sibling, synchronized, and atomically renamed. On Unix, cache
-directories use mode `0700` and files use `0600`.
+unique temporary sibling, flushed, and atomically renamed; no `fsync` is issued
+because the cache is regenerable and a truncated entry is detected and rewritten.
+Sources larger than twice the size class are box-reduced before the Lanczos3
+pass. On Unix, cache directories use mode `0700` and files use `0600`.
 
 Corrupt files, permission failures, full filesystems, or unavailable cache homes
 degrade to original-image decoding. They do not stop browsing.
