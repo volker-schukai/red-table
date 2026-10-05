@@ -39,6 +39,21 @@ pub(crate) struct RenderOptions<'a> {
 }
 
 impl GridLayout {
+    /// Layout the grid renderer would compute for `area`, exposed so frame
+    /// tests can derive the exact thumbnail key.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(area: Rect, thumbnail_size: ThumbnailSize) -> Self {
+        let chrome = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(1),
+                Constraint::Length(2),
+            ])
+            .split(area);
+        Self::new(chrome[1], thumbnail_size)
+    }
+
     fn new(area: Rect, thumbnail_size: ThumbnailSize) -> Self {
         let columns = (area.width / thumbnail_size.width).max(1) as usize;
         let rows = (area.height / thumbnail_size.height).max(1) as usize;

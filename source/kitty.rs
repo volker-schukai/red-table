@@ -6,7 +6,7 @@ use std::{
     io::{self, Write as IoWrite},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -39,7 +39,16 @@ pub(crate) struct KittySession {
 struct KittySessionInner {
     is_tmux: bool,
     state: Mutex<KittySessionState>,
+    /// Transmissions consumed by placeholder renders since the last
+    /// [`KittySession::nudge_repaint`].
+    transmissions: AtomicU64,
 }
+
+/// Written shortly after a frame that transmitted image data so the terminal
+/// runs another repaint and resolves the new virtual placement. DECTCEM "hide
+/// cursor" is already in effect while drawing, so the sequence changes no
+/// visible state.
+const REPAINT_NUDGE: &[u8] = b"\x1b[?25l";
 
 #[derive(Default)]
 struct KittySessionState {
@@ -57,6 +66,7 @@ impl KittySession {
             inner: Arc::new(KittySessionInner {
                 is_tmux,
                 state: Mutex::new(KittySessionState::default()),
+                transmissions: AtomicU64::new(0),
             }),
         }
     }
@@ -92,6 +102,19 @@ impl KittySession {
             }
         }
         Ok(pending.len())
+    }
+
+    /// Returns how many transmissions were rendered since the last call and
+    /// resets the count.
+    pub(crate) fn take_transmissions(&self) -> u64 {
+        self.inner.transmissions.swap(0, Ordering::AcqRel)
+    }
+
+    /// Writes one repaint nudge. The caller schedules it a short time after
+    /// the transmitting frame; written in the same burst it has no effect.
+    pub(crate) fn write_repaint_nudge(writer: &mut dyn IoWrite) -> io::Result<()> {
+        writer.write_all(REPAINT_NUDGE)?;
+        writer.flush()
     }
 
     fn allocate_image_id(&self) -> Result<u32, String> {
@@ -222,6 +245,10 @@ impl KittyProtocol {
             .then_some(self.transmission.as_str());
         if transmission.is_some() {
             self.ever_transmitted.store(true, Ordering::Release);
+            self.session
+                .inner
+                .transmissions
+                .fetch_add(1, Ordering::AcqRel);
         }
         let trailing_placeholders: String =
             std::iter::repeat_n(PLACEHOLDER, usize::from(width.saturating_sub(1))).collect();
@@ -809,6 +836,57 @@ mod tests {
                 .symbol()
                 .contains("a=T,U=1")
         );
+    }
+
+    #[test]
+    fn session_counts_rendered_transmissions_and_nudges_once_per_batch() {
+        let session = KittySession::with_tmux(false);
+        let first = KittyProtocol::new(
+            DynamicImage::new_rgba8(1, 1),
+            Size::new(1, 1),
+            session.clone(),
+        )
+        .unwrap();
+        let second = KittyProtocol::new(
+            DynamicImage::new_rgba8(1, 1),
+            Size::new(1, 1),
+            session.clone(),
+        )
+        .unwrap();
+        assert_eq!(session.take_transmissions(), 0);
+
+        let mut terminal = Terminal::new(TestBackend::new(2, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(KittyImage::new(&first), Rect::new(area.x, area.y, 1, 1));
+                frame.render_widget(
+                    KittyImage::new(&second),
+                    Rect::new(area.x + 1, area.y, 1, 1),
+                );
+            })
+            .unwrap();
+        assert_eq!(session.take_transmissions(), 2);
+        assert_eq!(session.take_transmissions(), 0);
+
+        terminal
+            .draw(|frame| frame.render_widget(KittyImage::new(&first), frame.area()))
+            .unwrap();
+        assert_eq!(
+            session.take_transmissions(),
+            0,
+            "placeholder-only frames transmit nothing"
+        );
+
+        assert!(first.rearm());
+        terminal
+            .draw(|frame| frame.render_widget(KittyImage::new(&first), frame.area()))
+            .unwrap();
+        assert_eq!(session.take_transmissions(), 1);
+
+        let mut output = Vec::new();
+        KittySession::write_repaint_nudge(&mut output).unwrap();
+        assert_eq!(output, REPAINT_NUDGE);
     }
 
     #[test]

@@ -116,6 +116,10 @@
           RUST_BACKTRACE = "1";
 
           shellHook = ''
+            # The invoking shell may carry a dynamic-linker search path from
+            # another environment. It would shadow this closure's libraries,
+            # so the shell owns the search path and drops the inherited value.
+            unset LD_LIBRARY_PATH
             ${pkgs.figlet}/bin/figlet -w 120 "red-table"
             printf '\n'
             printf '  Rust image browser | performance first | keyboard driven\n'

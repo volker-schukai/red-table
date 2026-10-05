@@ -24,6 +24,11 @@ use crate::{
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// Delays after a frame that transmitted Kitty image data at which a
+/// state-neutral repaint nudge is written. The terminal resolves new virtual
+/// placements only on a repaint that follows the transmitting input burst;
+/// the second nudge covers slow renderers.
+const REPAINT_NUDGE_DELAYS: [Duration; 2] = [Duration::from_millis(50), Duration::from_millis(300)];
 /// Poll interval while no scan, thumbnail, inspection, or cleanup work is
 /// pending; only input and resize events need to wake the loop.
 const IDLE_INTERVAL: Duration = Duration::from_millis(250);
@@ -113,6 +118,7 @@ struct Browser {
     running: bool,
     selection_mode: bool,
     confirmed: bool,
+    repaint_nudges: Vec<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -231,6 +237,7 @@ impl Browser {
             running: true,
             selection_mode,
             confirmed: false,
+            repaint_nudges: Vec::new(),
         }
     }
 
@@ -240,81 +247,130 @@ impl Browser {
             let frame_started = Instant::now();
             dirty |= self.drain_background_work();
             dirty |= self.kitty_session.drain_cleanup(terminal.backend_mut())? > 0;
+            self.write_due_repaint_nudges(terminal.backend_mut(), frame_started)?;
             if dirty {
-                self.prepare_render_visibility();
-                terminal.draw(|frame| match self.view {
-                    BrowserView::Grid => {
-                        self.grid = ui::render_grid(
-                            frame,
-                            &mut self.app,
-                            &mut self.thumbnails,
-                            RenderOptions {
-                                protocol_name: &self.protocol_name,
-                                thumbnail_size: self.thumbnail_size,
-                                thumbnail_quality: self.thumbnail_quality,
-                                bindings: &self.bindings,
-                                show_help: self.show_help,
-                                debug_status: self.debug_status,
-                                selection_mode: self.selection_mode,
-                            },
-                        );
-                    }
-                    BrowserView::Inspect(state) => {
-                        let display = self
-                            .inspection_key
-                            .map(|key| self.inspection.display(key))
-                            .unwrap_or(InspectionDisplay::Loading);
-                        self.inspection_size = ui::render_inspection(
-                            frame,
-                            &self.app,
-                            InspectionOptions {
-                                display,
-                                state,
-                                background: self.background,
-                                bindings: &self.bindings,
-                                show_help: self.show_help,
-                                debug_status: self.debug_status,
-                                protocol_name: &self.protocol_name,
-                                selection_mode: self.selection_mode,
-                            },
-                        );
-                    }
-                    BrowserView::Compare(state) => {
-                        let reference_display = self
-                            .inspection_key
-                            .map(|key| self.inspection.display(key))
-                            .unwrap_or(InspectionDisplay::Loading);
-                        let candidate_display = self
-                            .comparison_key
-                            .map(|key| self.comparison_inspection.display(key))
-                            .unwrap_or(InspectionDisplay::Loading);
-                        let sizes = ui::render_comparison(
-                            frame,
-                            &self.app,
-                            ComparisonOptions {
-                                state,
-                                reference_display,
-                                candidate_display,
-                                background: self.background,
-                                bindings: &self.bindings,
-                                show_help: self.show_help,
-                                debug_status: self.debug_status,
-                                protocol_name: &self.protocol_name,
-                                selection_mode: self.selection_mode,
-                            },
-                        );
-                        self.inspection_size = sizes[0];
-                        self.comparison_size = sizes[1];
-                    }
-                })?;
+                self.render_frame(terminal)?;
                 dirty = self.schedule_work();
             }
 
-            let wait =
-                poll_interval(self.has_background_work()).saturating_sub(frame_started.elapsed());
+            let now = Instant::now();
+            let wait = self
+                .poll_wait(now)
+                .saturating_sub(now.duration_since(frame_started));
             if event::poll(wait)? {
                 dirty |= self.handle_event(event::read()?);
             }
+        }
+        Ok(())
+    }
+
+    /// Time to wait for input: the frame or idle interval, shortened so a due
+    /// repaint nudge is not delayed past its schedule.
+    fn poll_wait(&self, now: Instant) -> Duration {
+        let interval = poll_interval(self.has_background_work());
+        self.repaint_nudges
+            .iter()
+            .map(|due| due.saturating_duration_since(now))
+            .min()
+            .map_or(interval, |until_nudge| interval.min(until_nudge))
+    }
+
+    /// Writes one repaint nudge when at least one scheduled nudge is due and
+    /// drops every due entry. Returns how many entries were due.
+    fn write_due_repaint_nudges(
+        &mut self,
+        writer: &mut dyn io::Write,
+        now: Instant,
+    ) -> io::Result<usize> {
+        let due = self.repaint_nudges.iter().filter(|at| **at <= now).count();
+        if due == 0 {
+            return Ok(0);
+        }
+        self.repaint_nudges.retain(|at| *at > now);
+        KittySession::write_repaint_nudge(writer)?;
+        Ok(due)
+    }
+
+    /// Draws one frame and, when it transmitted Kitty image data, schedules
+    /// the repaint nudges so the new placements are painted without input.
+    fn render_frame(&mut self, terminal: &mut AppTerminal) -> Result<(), BoxError> {
+        self.render_frame_at(terminal, Instant::now())
+    }
+
+    fn render_frame_at(
+        &mut self,
+        terminal: &mut AppTerminal,
+        now: Instant,
+    ) -> Result<(), BoxError> {
+        self.prepare_render_visibility();
+        terminal.draw(|frame| match self.view {
+            BrowserView::Grid => {
+                self.grid = ui::render_grid(
+                    frame,
+                    &mut self.app,
+                    &mut self.thumbnails,
+                    RenderOptions {
+                        protocol_name: &self.protocol_name,
+                        thumbnail_size: self.thumbnail_size,
+                        thumbnail_quality: self.thumbnail_quality,
+                        bindings: &self.bindings,
+                        show_help: self.show_help,
+                        debug_status: self.debug_status,
+                        selection_mode: self.selection_mode,
+                    },
+                );
+            }
+            BrowserView::Inspect(state) => {
+                let display = self
+                    .inspection_key
+                    .map(|key| self.inspection.display(key))
+                    .unwrap_or(InspectionDisplay::Loading);
+                self.inspection_size = ui::render_inspection(
+                    frame,
+                    &self.app,
+                    InspectionOptions {
+                        display,
+                        state,
+                        background: self.background,
+                        bindings: &self.bindings,
+                        show_help: self.show_help,
+                        debug_status: self.debug_status,
+                        protocol_name: &self.protocol_name,
+                        selection_mode: self.selection_mode,
+                    },
+                );
+            }
+            BrowserView::Compare(state) => {
+                let reference_display = self
+                    .inspection_key
+                    .map(|key| self.inspection.display(key))
+                    .unwrap_or(InspectionDisplay::Loading);
+                let candidate_display = self
+                    .comparison_key
+                    .map(|key| self.comparison_inspection.display(key))
+                    .unwrap_or(InspectionDisplay::Loading);
+                let sizes = ui::render_comparison(
+                    frame,
+                    &self.app,
+                    ComparisonOptions {
+                        state,
+                        reference_display,
+                        candidate_display,
+                        background: self.background,
+                        bindings: &self.bindings,
+                        show_help: self.show_help,
+                        debug_status: self.debug_status,
+                        protocol_name: &self.protocol_name,
+                        selection_mode: self.selection_mode,
+                    },
+                );
+                self.inspection_size = sizes[0];
+                self.comparison_size = sizes[1];
+            }
+        })?;
+        if self.kitty_session.take_transmissions() > 0 {
+            self.repaint_nudges
+                .extend(REPAINT_NUDGE_DELAYS.iter().map(|delay| now + *delay));
         }
         Ok(())
     }
@@ -1135,6 +1191,128 @@ mod tests {
         assert!(output.contains(&format!("a=d,d=I,i={transmitted_id}")));
         assert!(!output.contains(&format!("i={never_sent_id}")));
         assert!(!session.has_pending_cleanup());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn frames_that_transmit_kitty_images_schedule_delayed_repaint_nudges() {
+        use std::sync::{Arc, Mutex};
+
+        use image::DynamicImage;
+        use ratatui::{
+            Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect,
+        };
+
+        use crate::{kitty::KittyProtocol, thumbnails::PreparedThumbnail, ui::GridLayout};
+
+        #[derive(Clone)]
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for SharedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (mut browser, root) = browser_with_images();
+        browser.app.scan_done = true;
+        assert!(!browser.has_background_work());
+        let output = SharedWriter(Arc::new(Mutex::new(Vec::new())));
+        let backend = CrosstermBackend::new(Box::new(output.clone()) as Box<dyn io::Write + Send>);
+        let area = Rect::new(0, 0, 40, 20);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .unwrap();
+        let transmitted = |output: &SharedWriter| {
+            String::from_utf8_lossy(&output.0.lock().unwrap()).contains("a=T,U=1")
+        };
+        let start = Instant::now();
+
+        browser.render_frame_at(&mut terminal, start).unwrap();
+        assert!(!transmitted(&output));
+        assert!(
+            browser.repaint_nudges.is_empty(),
+            "no transmission, no nudge"
+        );
+        assert_eq!(
+            browser.poll_wait(start),
+            poll_interval(browser.has_background_work())
+        );
+
+        let image_size = GridLayout::new_for_test(area, DEFAULT_THUMBNAIL_SIZE).image_size;
+        let entry = browser.app.selected_entry().unwrap();
+        let key = ThumbnailKey {
+            entry_id: entry.id,
+            revision: entry.revision,
+            size: image_size,
+            quality: browser.thumbnail_quality,
+        };
+        let protocol = KittyProtocol::new(
+            DynamicImage::new_rgba8(2, 2),
+            image_size,
+            browser.kitty_session.clone(),
+        )
+        .unwrap();
+        browser
+            .thumbnails
+            .insert(key, PreparedThumbnail::Kitty(protocol));
+        output.0.lock().unwrap().clear();
+        browser.render_frame_at(&mut terminal, start).unwrap();
+        assert!(
+            transmitted(&output),
+            "the frame must transmit the inserted image"
+        );
+        assert_eq!(
+            browser.repaint_nudges,
+            REPAINT_NUDGE_DELAYS.map(|delay| start + delay).to_vec()
+        );
+        assert_eq!(browser.poll_wait(start), REPAINT_NUDGE_DELAYS[0]);
+
+        let mut nudges = Vec::new();
+        assert_eq!(
+            browser
+                .write_due_repaint_nudges(&mut nudges, start + Duration::from_millis(10))
+                .unwrap(),
+            0
+        );
+        assert!(
+            nudges.is_empty(),
+            "nothing is written before the first delay"
+        );
+        assert_eq!(
+            browser
+                .write_due_repaint_nudges(&mut nudges, start + REPAINT_NUDGE_DELAYS[0])
+                .unwrap(),
+            1
+        );
+        assert_eq!(nudges, b"\x1b[?25l");
+        assert_eq!(browser.repaint_nudges.len(), 1);
+        assert_eq!(
+            browser.poll_wait(start + REPAINT_NUDGE_DELAYS[0]),
+            REPAINT_NUDGE_DELAYS[1] - REPAINT_NUDGE_DELAYS[0]
+        );
+        assert_eq!(
+            browser
+                .write_due_repaint_nudges(&mut nudges, start + Duration::from_secs(5))
+                .unwrap(),
+            1
+        );
+        assert!(browser.repaint_nudges.is_empty());
+
+        output.0.lock().unwrap().clear();
+        browser.render_frame_at(&mut terminal, start).unwrap();
+        assert!(
+            !transmitted(&output),
+            "placeholder-only frames do not retransmit"
+        );
+        assert!(browser.repaint_nudges.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
