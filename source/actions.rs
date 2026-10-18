@@ -14,6 +14,7 @@ pub(crate) enum ActionContext {
 pub(crate) enum Action {
     Quit,
     StartSearch,
+    ToggleSort,
     CancelSearch,
     CommitSearch,
     DeleteSearchCharacter,
@@ -59,6 +60,7 @@ impl Action {
         match name {
             "quit" => Ok(Self::Quit),
             "search" => Ok(Self::StartSearch),
+            "toggle_sort" => Ok(Self::ToggleSort),
             "cancel" => Ok(Self::CancelSearch),
             "confirm" => Ok(Self::CommitSearch),
             "backspace" => Ok(Self::DeleteSearchCharacter),
@@ -113,6 +115,7 @@ impl Action {
         match self {
             Self::Quit => "quit",
             Self::StartSearch => "search",
+            Self::ToggleSort => "discovery / path order",
             Self::CancelSearch => "cancel",
             Self::CommitSearch => "confirm",
             Self::DeleteSearchCharacter => "delete character",
@@ -316,6 +319,7 @@ impl Bindings {
         for (context, action, keys) in [
             (ActionContext::Normal, Action::Quit, &["q"][..]),
             (ActionContext::Normal, Action::StartSearch, &["/"][..]),
+            (ActionContext::Normal, Action::ToggleSort, &["s"][..]),
             (
                 ActionContext::Normal,
                 Action::ThumbnailLarger,
@@ -595,6 +599,49 @@ mod tests {
                 .is_err()
         );
         assert!("Ctrl+c".parse::<KeyChord>().is_err());
+    }
+
+    #[test]
+    fn sort_binding_can_be_replaced_and_help_tracks_the_active_key() {
+        let mut bindings = Bindings::built_in();
+        let action = Action::from_name("toggle_sort").unwrap();
+        assert_eq!(
+            bindings.action(
+                ActionContext::Normal,
+                event(KeyCode::Char('s'), KeyModifiers::NONE)
+            ),
+            Some(action)
+        );
+        bindings
+            .replace_action(ActionContext::Normal, action, ["F6"])
+            .unwrap();
+        assert_eq!(
+            bindings.action(
+                ActionContext::Normal,
+                event(KeyCode::Char('s'), KeyModifiers::NONE)
+            ),
+            None
+        );
+        assert_eq!(
+            bindings.action(
+                ActionContext::Normal,
+                event(KeyCode::F(6), KeyModifiers::NONE)
+            ),
+            Some(Action::ToggleSort)
+        );
+        assert!(
+            bindings
+                .help_lines(ActionContext::Normal)
+                .iter()
+                .any(|line| { line.contains("F6") && line.contains("discovery / path order") })
+        );
+        assert_eq!(
+            bindings.action(
+                ActionContext::Search,
+                event(KeyCode::Char('s'), KeyModifiers::NONE)
+            ),
+            None
+        );
     }
 
     #[test]

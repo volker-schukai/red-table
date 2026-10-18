@@ -14,9 +14,9 @@ pub(crate) enum InputMode {
 /// Display order of entries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EntryOrder {
-    /// Byte-wise ascending path order, the order directory scans use.
+    /// Byte-wise ascending path order, explicitly selected by the user.
     Path,
-    /// The order in which paths were added, used for explicit input lists.
+    /// The order in which paths were added, the default for every session.
     Arrival,
 }
 
@@ -66,9 +66,8 @@ pub(crate) struct App {
 }
 
 impl App {
-    #[cfg(test)]
     pub(crate) fn new(root: PathBuf) -> Self {
-        Self::with_order(root, EntryOrder::Path)
+        Self::with_order(root, EntryOrder::Arrival)
     }
 
     pub(crate) fn with_order(root: PathBuf, order: EntryOrder) -> Self {
@@ -137,8 +136,13 @@ impl App {
             return false;
         }
         let mut batch = std::mem::take(&mut self.pending_ids);
-        batch.sort_unstable_by(|a, b| self.compare(*a, *b));
-        self.sorted = merge(&self.sorted, &batch, |a, b| self.compare(a, b));
+        match self.order {
+            EntryOrder::Arrival => self.sorted.extend_from_slice(&batch),
+            EntryOrder::Path => {
+                batch.sort_unstable_by(|a, b| self.compare(*a, *b));
+                self.sorted = merge(&self.sorted, &batch, |a, b| self.compare(a, b));
+            }
+        }
 
         let needle = self.query.to_lowercase();
         let visible_batch = batch
@@ -150,9 +154,33 @@ impl App {
             return true;
         }
         let selected_id = self.filtered.get(self.selected).copied();
-        self.filtered = merge(&self.filtered, &visible_batch, |a, b| self.compare(a, b));
+        match self.order {
+            EntryOrder::Arrival => self.filtered.extend_from_slice(&visible_batch),
+            EntryOrder::Path => {
+                self.filtered = merge(&self.filtered, &visible_batch, |a, b| self.compare(a, b));
+            }
+        }
         self.restore_selection(selected_id, self.selected);
         true
+    }
+
+    pub(crate) const fn order_label(&self) -> &'static str {
+        match self.order {
+            EntryOrder::Arrival => "discovery order",
+            EntryOrder::Path => "path order",
+        }
+    }
+
+    pub(crate) fn toggle_sort(&mut self) {
+        self.integrate_pending();
+        self.order = match self.order {
+            EntryOrder::Arrival => EntryOrder::Path,
+            EntryOrder::Path => EntryOrder::Arrival,
+        };
+        let mut ordered = std::mem::take(&mut self.sorted);
+        ordered.sort_unstable_by(|a, b| self.compare(*a, *b));
+        self.sorted = ordered;
+        self.rebuild_filter();
     }
 
     pub(crate) fn selected_entry(&self) -> Option<&ImageEntry> {
@@ -635,7 +663,7 @@ mod tests {
 
     #[test]
     fn incremental_batches_merge_in_order_and_keep_focus_identity() {
-        let mut app = App::new("/photos".into());
+        let mut app = App::with_order("/photos".into(), EntryOrder::Path);
         for name in ["m.jpg", "c.jpg"] {
             app.add_path(
                 PathBuf::from("/photos").join(name),
@@ -672,7 +700,7 @@ mod tests {
 
     #[test]
     fn search_and_selected_only_follow_path_order_during_integration() {
-        let mut app = App::new("/photos".into());
+        let mut app = App::with_order("/photos".into(), EntryOrder::Path);
         for name in ["trip/b.jpg", "home/a.jpg"] {
             app.add_path(
                 PathBuf::from("/photos").join(name),
@@ -711,6 +739,71 @@ mod tests {
         assert_eq!(
             visible_names(&app),
             vec!["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+        );
+    }
+
+    #[test]
+    fn default_discovery_order_keeps_existing_positions_across_large_scan_batches() {
+        let mut app = App::new("/photos".into());
+        for batch in 0..100 {
+            let prefix = app.filtered.clone();
+            for offset in 0..100 {
+                let number = 10_000 - (batch * 100 + offset);
+                app.add_path(
+                    PathBuf::from(format!("/photos/{number:05}.png")),
+                    SourceRevision::default(),
+                );
+            }
+            app.integrate_pending();
+            assert!(app.filtered.starts_with(&prefix));
+            assert_eq!(app.selected, 0);
+        }
+        assert_eq!(app.filtered, (0..10_000).map(EntryId).collect::<Vec<_>>());
+        app.scan_done = true;
+        assert!(!app.integrate_pending());
+        assert_eq!(app.selected_entry().unwrap().label, "10000.png");
+    }
+
+    #[test]
+    fn explicit_sort_round_trip_preserves_focus_filters_marks_and_late_arrivals() {
+        let mut app = app_with_images(&["trip/z.jpg", "home/a.jpg", "trip/m.jpg"]);
+        app.toggle_mark();
+        app.selected = 2;
+        app.toggle_mark();
+        let focused = app.selected_entry().unwrap().id;
+        let marked_paths = app.marked_paths();
+        app.start_search();
+        for character in "trip".chars() {
+            app.push_search(character);
+        }
+        app.commit_search();
+        app.toggle_marked_only();
+        // Include an unintegrated discovery when the user changes order.
+        app.add_path("/photos/trip/b.jpg".into(), SourceRevision::default());
+        app.toggle_sort();
+        assert_eq!(visible_names(&app), ["m.jpg", "z.jpg"]);
+        assert_eq!(app.selected_entry().unwrap().id, focused);
+        assert_eq!(app.marked_paths(), marked_paths);
+        app.toggle_marked_only();
+        assert_eq!(visible_names(&app), ["b.jpg", "m.jpg", "z.jpg"]);
+        app.add_path("/photos/trip/a.jpg".into(), SourceRevision::default());
+        app.integrate_pending();
+        assert_eq!(visible_names(&app), ["a.jpg", "b.jpg", "m.jpg", "z.jpg"]);
+        app.toggle_sort();
+        assert_eq!(visible_names(&app), ["z.jpg", "m.jpg", "b.jpg", "a.jpg"]);
+        assert_eq!(app.selected_entry().unwrap().id, focused);
+        assert_eq!(app.marked_paths(), marked_paths);
+        for (position, id) in app.filtered.iter().enumerate() {
+            assert_eq!(app.filtered_position(*id), Some(position));
+        }
+        app.start_search();
+        while !app.query.is_empty() {
+            app.pop_search();
+        }
+        app.commit_search();
+        assert_eq!(
+            visible_names(&app),
+            ["z.jpg", "a.jpg", "m.jpg", "b.jpg", "a.jpg"]
         );
     }
 

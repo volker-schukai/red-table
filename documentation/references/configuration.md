@@ -31,6 +31,7 @@ background = "checkerboard" # checkerboard, dark, or light
 decoded_cache_mib = 512      # 64 through 2048
 
 [keys.normal]
+toggle_sort = ["s"]
 quit = ["q"]
 inspect = ["Enter"]
 compare = ["c"]

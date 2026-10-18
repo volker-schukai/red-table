@@ -11,7 +11,7 @@ use ratatui_image::picker::Picker;
 use crate::{
     BoxError,
     actions::{Action, ActionContext, Bindings},
-    app::{App, EntryId, EntryOrder, InputMode},
+    app::{App, EntryId, InputMode},
     config::RuntimeSettings,
     graphics,
     inspection::{DecodedSources, Inspection, InspectionDisplay, InspectionKey, ViewState},
@@ -195,17 +195,12 @@ impl Browser {
         );
         let comparison_inspection =
             Inspection::with_session(picker.clone(), decoded_sources, kitty_session.clone());
-        let order = if input_paths.is_some() {
-            EntryOrder::Arrival
-        } else {
-            EntryOrder::Path
-        };
         Self {
             scanner: match input_paths {
                 Some(paths) => scan::start_paths(root.clone(), paths),
                 None => scan::start(root.clone()),
             },
-            app: App::with_order(root, order),
+            app: App::new(root),
             thumbnails: Thumbnails::with_session(picker, kitty_session.clone()),
             kitty_session,
             inspection,
@@ -602,6 +597,7 @@ impl Browser {
         match action {
             Some(Action::Quit) => self.running = false,
             Some(Action::StartSearch) => self.app.start_search(),
+            Some(Action::ToggleSort) => self.app.toggle_sort(),
             Some(Action::ThumbnailLarger) => {
                 self.thumbnail_size = self.thumbnail_size.larger_for_grid(
                     self.grid.area.width,
@@ -959,6 +955,36 @@ mod tests {
         browser.grid.columns = 2;
         browser.grid.rows = 1;
         (browser, root)
+    }
+
+    #[test]
+    fn scan_completion_keeps_discovery_order_until_the_user_sorts() {
+        let (mut browser, root) = browser_with_images();
+        let original = browser.app.filtered.clone();
+        let focused = browser.app.selected_entry().unwrap().id;
+        let (sender, receiver) = mpsc::sync_channel(2);
+        browser.scanner = receiver;
+        sender
+            .send(ScanEvent::Found {
+                path: root.join("0-late.png"),
+                revision: SourceRevision::default(),
+            })
+            .unwrap();
+        sender.send(ScanEvent::Done).unwrap();
+        assert!(browser.drain_background_work());
+        assert!(browser.app.scan_done);
+        assert!(browser.app.filtered.starts_with(&original));
+        let sort_key = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(browser.handle_event(sort_key.clone()));
+        assert_eq!(
+            browser.app.entry(browser.app.filtered[0]).unwrap().label,
+            "0-late.png"
+        );
+        assert_eq!(browser.app.selected_entry().unwrap().id, focused);
+        assert!(browser.handle_event(sort_key));
+        assert!(browser.app.filtered.starts_with(&original));
+        assert_eq!(browser.app.selected_entry().unwrap().id, focused);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

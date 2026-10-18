@@ -74,6 +74,7 @@ Run `task` to list every development command.
 - arrow keys or `h`, `j`, `k`, `l`: move the selection
 - Enter: inspect the focused image fullscreen; Escape returns to the exact grid position
 - `c`: compare the focused reference against candidates in two panes
+- `s`: toggle discovery / path order; sessions start in stable discovery order
 - Page Up, Page Down, Home, End: move across larger collections
 - `+` / `-`: enlarge or shrink thumbnails; `0` restores the `32x14` default
 - `1` through `9`: select thumbnail quality immediately; the default is `7`

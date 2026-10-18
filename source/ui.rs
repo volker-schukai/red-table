@@ -166,10 +166,11 @@ fn render_header(
     let errors = app.scan_errors + app.thumbnail_errors;
     let status = if options.debug_status {
         Line::from(format!(
-            " {selected}/{} · {} marked · {} found · {state} · {pending} load · {} · Q{} · {protocol_name} · M{memory_entries}/{}MiB · D{disk_hits}/{disk_misses} · {errors} err",
+            " {selected}/{} · {} marked · {} found · {state} · {} · {pending} load · {} · Q{} · {protocol_name} · M{memory_entries}/{}MiB · D{disk_hits}/{disk_misses} · {errors} err",
             app.filtered.len(),
             app.marked_count(),
             app.entries.len(),
+            app.order_label(),
             options.thumbnail_size,
             options.thumbnail_quality,
             memory_bytes.div_ceil(1024 * 1024),
@@ -186,11 +187,12 @@ fn render_header(
             String::new()
         };
         Line::from(format!(
-            " {selected}/{} · {} marked{} · {} found · {state}{loading}{failures}",
+            " {selected}/{} · {} marked{} · {} found · {state} · {}{loading}{failures}",
             app.filtered.len(),
             app.marked_count(),
             if app.marked_only() { " (only)" } else { "" },
             app.entries.len(),
+            app.order_label(),
         ))
     };
     frame.render_widget(Paragraph::new(vec![title, status]), area);
@@ -333,18 +335,20 @@ fn render_footer(
         .unwrap_or_default();
     let help = match app.mode {
         InputMode::Normal if selection_mode => format!(
-            " {} mark · {} range · {} marked only · {} confirm · {} help",
+            " {} mark · {} range · {} marked only · {} sort · {} confirm · {} help",
             bindings.keys_for(ActionContext::Normal, Action::ToggleMark),
             bindings.keys_for(ActionContext::Normal, Action::MarkRange),
             bindings.keys_for(ActionContext::Normal, Action::ToggleMarkedOnly),
+            bindings.keys_for(ActionContext::Normal, Action::ToggleSort),
             bindings.keys_for(ActionContext::Normal, Action::ConfirmSelection),
             bindings.keys_for(ActionContext::Normal, Action::ToggleHelp),
         ),
         InputMode::Normal => format!(
-            " {} mark · {} range · {} marked only · {} help",
+            " {} mark · {} range · {} marked only · {} sort · {} help",
             bindings.keys_for(ActionContext::Normal, Action::ToggleMark),
             bindings.keys_for(ActionContext::Normal, Action::MarkRange),
             bindings.keys_for(ActionContext::Normal, Action::ToggleMarkedOnly),
+            bindings.keys_for(ActionContext::Normal, Action::ToggleSort),
             bindings.keys_for(ActionContext::Normal, Action::ToggleHelp),
         ),
         InputMode::Search => format!(

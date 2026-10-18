@@ -400,6 +400,31 @@ impl Thumbnails {
             );
             return;
         }
+        // Protect what is actually displayed, including an older quality while
+        // its replacement is loading. The incoming exact result may retire its
+        // own fallback, but background completions must not erase other tiles.
+        let protected = self
+            .visible
+            .iter()
+            .filter(|visible| **visible != key)
+            .filter_map(|visible| {
+                self.cache
+                    .contains_key(visible)
+                    .then_some(*visible)
+                    .or_else(|| self.compatible_key(*visible))
+            })
+            .filter(|cached| *cached != key)
+            .collect::<HashSet<_>>();
+        let protected_bytes = protected
+            .iter()
+            .map(|key| self.cache[key].resident_bytes())
+            .sum::<u64>();
+        if protected.len() >= self.cache_entry_limit
+            || protected_bytes.saturating_add(resident_bytes) > self.cache_byte_limit
+        {
+            self.insert_failure(key, "visible thumbnails fill the cache memory limit".into());
+            return;
+        }
         self.failed.remove(&key);
         self.failure_order.retain(|candidate| *candidate != key);
         if let Some(previous) = self.cache.remove(&key) {
@@ -409,7 +434,12 @@ impl Thumbnails {
         while self.cache.len() >= self.cache_entry_limit
             || self.cache_bytes.saturating_add(resident_bytes) > self.cache_byte_limit
         {
-            if let Some(oldest) = self.insertion_order.pop_front() {
+            if let Some(position) = self
+                .insertion_order
+                .iter()
+                .position(|candidate| !protected.contains(candidate))
+            {
+                let oldest = self.insertion_order.remove(position).unwrap();
                 if let Some(removed) = self.cache.remove(&oldest) {
                     self.cache_bytes = self.cache_bytes.saturating_sub(removed.resident_bytes());
                 }
@@ -1224,6 +1254,145 @@ mod tests {
         assert!(lru.cache.contains_key(&key(1)));
         assert!(!lru.cache.contains_key(&key(2)));
         assert!(lru.cache.contains_key(&key(3)));
+    }
+
+    #[test]
+    fn background_completions_preserve_visible_tiles_under_both_cache_limits() {
+        let key = |id| ThumbnailKey {
+            entry_id: EntryId(id),
+            revision: SourceRevision::default(),
+            size: Size::new(4, 2),
+            quality: "7".parse().unwrap(),
+        };
+        let prepared = || {
+            prepare_image(
+                &Picker::halfblocks(),
+                DynamicImage::new_rgb8(4, 4),
+                Size::new(4, 2),
+                "7".parse().unwrap(),
+            )
+            .unwrap()
+        };
+        let bytes = prepared().resident_bytes();
+        for (entry_limit, byte_limit) in [(4, bytes * 20), (20, bytes * 4)] {
+            let mut thumbnails = Thumbnails::with_limits(
+                Picker::halfblocks(),
+                KittySession::with_tmux(false),
+                entry_limit,
+                byte_limit,
+                MAX_PENDING_REQUESTS,
+            );
+            thumbnails.update_visible([key(0), key(1), key(2)]);
+            for id in 0..3 {
+                thumbnails.insert(key(id), prepared());
+            }
+            // Do not touch the visible tiles: background results make them the
+            // oldest LRU objects, just as a burst between frames would.
+            for id in 3..603 {
+                thumbnails.insert(key(id), prepared());
+                assert!(thumbnails.cache.len() <= entry_limit);
+                assert!(thumbnails.cache_bytes <= byte_limit);
+                for visible in 0..3 {
+                    assert!(thumbnails.cache.contains_key(&key(visible)));
+                }
+            }
+            thumbnails.update_visible([key(602)]);
+            for id in 603..606 {
+                thumbnails.insert(key(id), prepared());
+            }
+            assert!(!thumbnails.cache.contains_key(&key(0)));
+            assert!(thumbnails.cache.contains_key(&key(602)));
+        }
+    }
+
+    #[test]
+    fn oversized_viewport_rejects_admission_without_erasing_ready_tiles() {
+        let key = |id| ThumbnailKey {
+            entry_id: EntryId(id),
+            revision: SourceRevision::default(),
+            size: Size::new(4, 2),
+            quality: "7".parse().unwrap(),
+        };
+        let prepared = || {
+            prepare_image(
+                &Picker::halfblocks(),
+                DynamicImage::new_rgb8(4, 4),
+                Size::new(4, 2),
+                "7".parse().unwrap(),
+            )
+            .unwrap()
+        };
+        let bytes = prepared().resident_bytes();
+        for (entries, budget) in [(1, bytes * 2), (2, bytes)] {
+            let mut thumbnails = Thumbnails::with_limits(
+                Picker::halfblocks(),
+                KittySession::with_tmux(false),
+                entries,
+                budget,
+                MAX_PENDING_REQUESTS,
+            );
+            thumbnails.update_visible([key(0), key(1)]);
+            thumbnails.insert(key(0), prepared());
+            thumbnails.insert(key(1), prepared());
+            assert!(matches!(
+                thumbnails.display(key(0)),
+                ThumbnailDisplay::Ready(_)
+            ));
+            assert!(matches!(
+                thumbnails.display(key(1)),
+                ThumbnailDisplay::Error(error) if error.contains("memory limit")
+            ));
+            assert_eq!(thumbnails.cache_stats(), (1, bytes));
+            assert!(!thumbnails.request(key(1), Arc::from(Path::new("unused.png")), 0));
+        }
+    }
+
+    #[test]
+    fn visible_quality_fallback_is_protected_until_exact_result_arrives() {
+        let low = ThumbnailKey {
+            entry_id: EntryId(1),
+            revision: SourceRevision::default(),
+            size: Size::new(4, 2),
+            quality: "1".parse().unwrap(),
+        };
+        let high = ThumbnailKey {
+            quality: "9".parse().unwrap(),
+            ..low
+        };
+        let background = ThumbnailKey {
+            entry_id: EntryId(2),
+            ..low
+        };
+        let prepared = |quality| {
+            prepare_image(
+                &Picker::halfblocks(),
+                DynamicImage::new_rgb8(4, 4),
+                low.size,
+                quality,
+            )
+            .unwrap()
+        };
+        let bytes = prepared(low.quality).resident_bytes();
+        let mut thumbnails = Thumbnails::with_limits(
+            Picker::halfblocks(),
+            KittySession::with_tmux(false),
+            1,
+            bytes,
+            MAX_PENDING_REQUESTS,
+        );
+        thumbnails.insert(low, prepared(low.quality));
+        thumbnails.pending.insert(high);
+        thumbnails.update_visible([high]);
+        thumbnails.insert(background, prepared(low.quality));
+        assert!(matches!(
+            thumbnails.display(high),
+            ThumbnailDisplay::Ready(_)
+        ));
+        assert!(thumbnails.cache.contains_key(&low));
+        thumbnails.insert(high, prepared(high.quality));
+        assert!(!thumbnails.cache.contains_key(&low));
+        assert!(thumbnails.cache.contains_key(&high));
+        assert_eq!(thumbnails.cache_stats(), (1, bytes));
     }
 
     #[test]

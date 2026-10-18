@@ -16,10 +16,14 @@ nix run . -- --thumbnail-size 40x18 /pfad/zu/bildern
 Erlaubt sind `12x6` bis `120x60`. Es handelt sich um Zielwerte; das Raster
 verteilt den verbleibenden Platz gleichmäßig.
 
-Verzeichnis-Scans zeigen Bilder byteweise aufsteigend nach ihrem Pfad relativ
-zum gescannten Verzeichnis, also in der Reihenfolge von `ls`. Bilder, die ein
-laufender Scan später findet, werden in diese Reihenfolge einsortiert. Eine
-Liste über `--files0-from` behält ihre Eingabereihenfolge.
+Bilder erscheinen zunächst in Fundreihenfolge. Neue Funde werden hinten
+angehängt; bereits angezeigte Bilder behalten ihren Platz, auch nach Scan-Ende.
+Eine Liste über `--files0-from` startet in ihrer Eingabereihenfolge. Mit `s` im
+Raster wechselst du zwischen Fundreihenfolge und byteweise aufsteigender
+Sortierung nach relativem Pfad. Fokus und Markierungen bleiben am jeweiligen
+Bild. Bei aktiver Pfadsortierung werden neue Funde einsortiert; ein weiteres
+`s` stellt die Fundreihenfolge wieder her. Die Statuszeile zeigt die aktuelle
+Reihenfolge. Jede neue Sitzung startet in Fundreihenfolge.
 
 Die Qualitätsstufe ist standardmäßig `7`. Beim Start kann sie von `1` (schnell)
 bis `9` (maximale Detailverstärkung) gesetzt werden:
@@ -58,6 +62,7 @@ vollständige Schema der Version 1 und alle Aktionsnamen.
 | Pos1 / Ende | ersten / letzten Treffer auswählen |
 | Enter | fokussiertes Bild als Großansicht öffnen |
 | `c` | fokussiertes Bild mit Kandidaten vergleichen |
+| `s` | zwischen Fundreihenfolge und Pfadsortierung wechseln |
 | Leertaste | dauerhafte `[x]`-Markierung und Doppelrahmen umschalten |
 | `v` | Bereich ab dem letzten Leertasten-Anker einschließlich markieren |
 | `u` / `m` | alle Markierungen löschen / nur markierte Bilder zeigen |

@@ -15,9 +15,13 @@ nix run . -- --thumbnail-size 40x18 /path/to/photos
 Accepted sizes range from `12x6` to `120x60`. They are target cell dimensions;
 the grid distributes remaining terminal space evenly.
 
-Directory scans show images in byte-wise ascending order of their path relative
-to the scanned directory, the order `ls` uses. Images found later in a running
-scan are merged into that order. A `--files0-from` list keeps its input order.
+Images initially appear in discovery order. New discoveries append to the grid;
+existing images keep their positions, including when the scan finishes. A
+`--files0-from` list starts in its input order. Press `s` in the grid to toggle
+between discovery order and byte-wise ascending relative path order. Focus and
+marks stay with their images. In path mode, new discoveries are inserted into
+path order; press `s` again to restore discovery order. The status shows the
+current order. Each new session starts in discovery order.
 
 Quality defaults to `7`. Set a startup level from `1` (fast) to `9` (maximum
 detail enhancement) with:
@@ -56,6 +60,7 @@ version 1 schema and configurable action names.
 | Home / End | select the first / last match |
 | Enter | inspect the focused image fullscreen |
 | `c` | compare the focused image against candidates |
+| `s` | toggle discovery / path order |
 | Space | toggle a persistent `[x]` mark and double border on the focused image |
 | `v` | mark the inclusive range from the last Space anchor |
 | `u` / `m` | clear all marks / show only marked images |

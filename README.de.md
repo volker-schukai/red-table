@@ -75,6 +75,7 @@ mit den eingebauten Werten.
 - Pfeiltasten oder `h`, `j`, `k`, `l`: Auswahl bewegen
 - Enter: fokussiertes Bild groß anzeigen; Escape kehrt exakt zum Raster zurück
 - `c`: fokussierte Referenz zweigeteilt mit Kandidaten vergleichen
+- `s`: Fundreihenfolge / Pfadsortierung umschalten; Start in stabiler Fundreihenfolge
 - Bild hoch, Bild runter, Pos1, Ende: größere Sprünge
 - `+` / `-`: Thumbnails vergrößern oder verkleinern; `0` setzt auf `32x14` zurück
 - `1` bis `9`: Thumbnail-Qualität sofort umschalten; Standard ist `7`
