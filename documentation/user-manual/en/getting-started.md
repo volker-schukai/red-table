@@ -42,6 +42,22 @@ Without a path, `red-table` opens the current directory. It discovers JPEG, PNG,
 GIF, WebP, TIFF, and BMP files incrementally, so the first results can appear
 before a large directory has been scanned completely.
 
+You can also pass an image directly:
+
+```sh
+red-table /path/to/photos/image.png
+```
+
+The image opens immediately in fullscreen inspection. Its parent directory is
+scanned recursively in the background. Press `Esc` to see the collection with
+that image focused, or `p`/`n` to inspect other discovered images. The requested
+image appears first in discovery order; `s` in the grid switches to path order.
+Symbolic links open their target image and its parent directory.
+
+CLI errors appear on stderr with an error label and recovery hint. Labels use
+color when stderr is a capable terminal. Redirected stderr, an unset or empty
+`TERM`, `TERM=dumb`, or nonempty `NO_COLOR` disable diagnostic color.
+
 ## Configuration
 
 Optional strict TOML configuration is discovered at
@@ -136,6 +152,65 @@ Selection mode deliberately skips the active escape-sequence capability probe
 because the current renderer library hard-wires that probe to stdout. Guarded
 environment detection and explicit `--graphics-protocol` selection remain
 available; ordinary browsing retains full active negotiation.
+
+## Shell integration
+
+`red-table shell-init bash|zsh|fish` prints an embedded integration script. It
+needs no terminal or configuration file and does not change your startup files.
+The installed `red-table` executable must be available in `PATH`.
+
+Add this line to `~/.bashrc` for Bash:
+
+```bash
+eval "$(red-table shell-init bash)"
+```
+
+For Zsh, initialize its completion system first, then load integration in
+`~/.zshrc`. If your framework already calls `compinit`, put the second line after
+that setup and omit the first line:
+
+```zsh
+autoload -Uz compinit && compinit
+eval "$(red-table shell-init zsh)"
+```
+
+For Fish, add this to `~/.config/fish/config.fish`:
+
+```fish
+red-table shell-init fish | source
+```
+
+Open a new shell or run the matching setup line in the current one. Tab completes
+options, quality levels, graphics protocols, thumbnail-size examples, shell names
+and filesystem paths. Configuration paths use ordinary file completion. To browse
+a directory literally named `shell-init`, use `red-table -- shell-init`.
+
+Press `Alt+i` while composing a command, for example after `cp `, to select images
+from the current directory and its subdirectories. Mark images with Space and
+confirm with Ctrl+s. The widget inserts shell-quoted paths at the cursor, without
+executing the command. `q`, an empty confirmation or an error leaves the command
+line unchanged. Newlines, quotes, metacharacters and non-UTF-8 filename bytes are
+preserved through NUL-delimited selection output. The widget declines to open
+when the text before the cursor has unfinished syntax, such as an open quote or
+command substitution. Invoke it between arguments outside quotes.
+
+The binding is installed in Bash/Zsh emacs and vi insert maps, and Fish default
+and insert maps. If Alt+i is already assigned, rebind `_red_table_pick` after the
+initialization line, for example to Ctrl+x followed by i:
+
+```bash
+bind -x '"\C-xi":_red_table_pick'
+```
+
+```zsh
+bindkey '^Xi' _red_table_pick
+```
+
+```fish
+bind \cxi _red_table_pick
+```
+
+Removing the initialization line and starting a fresh shell removes integration.
 
 ## Yazi integration
 

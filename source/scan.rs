@@ -93,7 +93,7 @@ pub(crate) fn start_paths(root: PathBuf, paths: Vec<PathBuf>) -> mpsc::Receiver<
     receiver
 }
 
-fn revision_for(path: &std::path::Path) -> Result<SourceRevision, ()> {
+pub(crate) fn revision_for(path: &std::path::Path) -> Result<SourceRevision, ()> {
     let metadata = path.metadata().map_err(|_| ())?;
     let modified = metadata.modified().map_err(|_| ())?;
     let modified_nanoseconds = match modified.duration_since(UNIX_EPOCH) {

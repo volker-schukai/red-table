@@ -44,6 +44,24 @@ Ohne Pfad öffnet `red-table` das aktuelle Verzeichnis. JPEG-, PNG-, GIF-, WebP-
 TIFF- und BMP-Dateien erscheinen inkrementell, ohne dass ein großes Verzeichnis
 zuerst vollständig gescannt werden muss.
 
+Auch ein Bild lässt sich direkt übergeben:
+
+```sh
+red-table /pfad/zu/bildern/bild.png
+```
+
+Das Bild öffnet sich sofort in der Einzelansicht. Sein übergeordnetes Verzeichnis
+wird im Hintergrund rekursiv durchsucht. Mit `Esc` erscheint die Sammlung mit
+diesem Bild im Fokus, mit `p`/`n` lassen sich weitere gefundene Bilder öffnen.
+Das übergebene Bild steht in der Entdeckungsreihenfolge zuerst; `s` schaltet im
+Raster auf Pfadsortierung um. Symbolische Links öffnen das Zielbild und dessen
+übergeordnetes Verzeichnis.
+
+CLI-Fehler erscheinen auf stderr mit Fehlerkennzeichnung und Hilfestellung.
+Die Beschriftungen sind farbig, wenn stderr ein geeignetes Terminal ist.
+Umgeleitetes stderr, fehlendes oder leeres `TERM`, `TERM=dumb` und nicht leeres
+`NO_COLOR` schalten diese Farben ab.
+
 ## Konfiguration
 
 Eine optionale, streng geprüfte TOML-Konfiguration wird unter
@@ -141,6 +159,68 @@ aktuelle Renderer-Bibliothek deren Escape-Sequenzen fest nach stdout schreibt.
 Abgesicherte Umgebungserkennung und eine ausdrückliche Wahl mit
 `--graphics-protocol` bleiben verfügbar; normales Browsen behält die vollständige
 aktive Aushandlung.
+
+## Shell-Integration
+
+`red-table shell-init bash|zsh|fish` gibt ein eingebettetes Integrationsskript
+aus. Dafür werden weder Terminal noch Konfigurationsdatei benötigt. Startdateien
+werden nicht verändert. Das installierte `red-table` muss in `PATH` liegen.
+
+Für Bash gehört diese Zeile in `~/.bashrc`:
+
+```bash
+eval "$(red-table shell-init bash)"
+```
+
+Für Zsh wird zuerst das Vervollständigungssystem initialisiert. In `~/.zshrc`:
+
+```zsh
+autoload -Uz compinit && compinit
+eval "$(red-table shell-init zsh)"
+```
+
+Ruft ein Shell-Framework bereits `compinit` auf, genügt die zweite Zeile nach
+dieser Einrichtung. Für Fish kommt Folgendes in `~/.config/fish/config.fish`:
+
+```fish
+red-table shell-init fish | source
+```
+
+Danach eine neue Shell öffnen oder die passende Zeile direkt ausführen. Tab
+vervollständigt Optionen, Qualitätsstufen, Grafikprotokolle, Beispielgrößen für
+Thumbnails, Shell-Namen und Dateipfade. Für Konfigurationsdateien gilt die normale
+Dateivervollständigung. Ein Verzeichnis mit dem Namen `shell-init` lässt sich mit
+`red-table -- shell-init` öffnen.
+
+Mit `Alt+i` lässt sich beim Schreiben eines Befehls, etwa nach `cp `, die
+Bildauswahl im aktuellen Verzeichnis samt Unterverzeichnissen öffnen. Space
+markiert Bilder, Ctrl+s bestätigt. Die Pfade werden passend für die Shell
+quotiert am Cursor eingefügt; der Befehl wird dabei nicht ausgeführt. `q`, eine
+leere Bestätigung oder ein Fehler lassen die Befehlszeile unverändert.
+NUL-getrennte Ausgabe erhält auch Zeilenumbrüche, Anführungszeichen,
+Shell-Sonderzeichen und Dateinamen mit Bytes außerhalb von UTF-8. Ist der Text
+vor dem Cursor unvollständig, etwa durch offene Anführungszeichen oder eine
+offene Befehlssubstitution, startet die Auswahl nicht. Das Kürzel wird zwischen
+Argumenten außerhalb von Anführungszeichen verwendet.
+
+Die Belegung gilt für die Emacs- und Vi-Einfügemodi von Bash und Zsh sowie die
+Default- und Insert-Belegung von Fish. Ist `Alt+i` schon belegt, kann
+`_red_table_pick` nach der Initialisierungszeile anders gebunden werden, zum
+Beispiel an Ctrl+x gefolgt von i:
+
+```bash
+bind -x '"\C-xi":_red_table_pick'
+```
+
+```zsh
+bindkey '^Xi' _red_table_pick
+```
+
+```fish
+bind \cxi _red_table_pick
+```
+
+Zum Entfernen die Initialisierungszeile löschen und eine neue Shell starten.
 
 ## Yazi-Integration
 

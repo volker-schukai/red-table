@@ -11,7 +11,7 @@ use ratatui_image::picker::Picker;
 use crate::{
     BoxError,
     actions::{Action, ActionContext, Bindings},
-    app::{App, EntryId, InputMode},
+    app::{App, EntryId, InputMode, SourceRevision, is_supported_image},
     config::RuntimeSettings,
     graphics,
     inspection::{DecodedSources, Inspection, InspectionDisplay, InspectionKey, ViewState},
@@ -46,19 +46,14 @@ pub(crate) fn run(
     selection_mode: bool,
     input_paths: Option<Vec<PathBuf>>,
 ) -> Result<BrowseOutcome, BoxError> {
-    let root = path
-        .canonicalize()
-        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-    if !root.is_dir() {
-        return Err(format!("not a directory: {}", root.display()).into());
-    }
+    let target = StartupTarget::resolve(&path)?;
 
     let mut terminal = TerminalSession::new(TerminalTarget::for_result_mode(selection_mode))?;
     let (picker, protocol_name) =
         graphics::select_picker(settings.graphics_protocol, !selection_mode);
     let kitty_session = KittySession::from_process();
     let mut browser = Browser::new(
-        root,
+        target.root,
         picker,
         protocol_name,
         settings,
@@ -66,6 +61,9 @@ pub(crate) fn run(
         input_paths,
         kitty_session.clone(),
     );
+    if let Some((path, revision)) = target.image {
+        browser.open_startup_image(path, revision);
+    }
     let loop_result = browser.run(terminal.terminal_mut());
     let close_result = close(
         browser,
@@ -75,6 +73,50 @@ pub(crate) fn run(
     terminal.restore();
     loop_result?;
     Ok(close_result?)
+}
+
+struct StartupTarget {
+    root: PathBuf,
+    image: Option<(PathBuf, SourceRevision)>,
+}
+
+impl StartupTarget {
+    fn resolve(path: &std::path::Path) -> Result<Self, BoxError> {
+        use crate::diagnostics::Diagnostic;
+
+        let resolved = path.canonicalize().map_err(|error| {
+            Diagnostic::new(
+                format!("cannot open {}: {error}", path.display()),
+                "Check that the path exists and that you have permission to read it.",
+            )
+        })?;
+        if resolved.is_dir() {
+            return Ok(Self {
+                root: resolved,
+                image: None,
+            });
+        }
+        if !resolved.is_file() || !is_supported_image(&resolved) {
+            return Err(Diagnostic::new(
+                format!("not a supported image or directory: {}", resolved.display()),
+                "Pass a directory or a JPEG, PNG, GIF, WebP, TIFF, or BMP image.",
+            )
+            .into());
+        }
+        let revision = scan::revision_for(&resolved).map_err(|()| {
+            Diagnostic::new(
+                format!("cannot read image metadata: {}", resolved.display()),
+                "Check that the image still exists and is readable.",
+            )
+        })?;
+        Ok(Self {
+            root: resolved
+                .parent()
+                .expect("regular file has a parent")
+                .to_path_buf(),
+            image: Some((resolved, revision)),
+        })
+    }
 }
 
 /// Finishes the browser and releases every terminal-side image it still owns.
@@ -178,6 +220,18 @@ impl CompareState {
 }
 
 impl Browser {
+    fn open_startup_image(&mut self, path: PathBuf, revision: SourceRevision) {
+        let id = self.app.add_path(path, revision);
+        self.app.integrate_pending();
+        self.app.selected = self
+            .app
+            .filtered
+            .iter()
+            .position(|entry| *entry == id)
+            .unwrap_or(0);
+        self.handle_normal_action(Some(Action::OpenInspect));
+    }
+
     fn new(
         root: PathBuf,
         picker: Picker,
@@ -955,6 +1009,93 @@ mod tests {
         browser.grid.columns = 2;
         browser.grid.rows = 1;
         (browser, root)
+    }
+
+    #[test]
+    fn image_startup_keeps_focus_when_the_parent_scan_finishes_and_escape_returns_to_grid() {
+        let (old_browser, root) = browser_with_images();
+        drop(old_browser);
+        for name in ["1-one.png", "2-two.png", "3-three.png"] {
+            fs::write(root.join(name), b"decode stays asynchronous").unwrap();
+        }
+        let image = root.join("2-two.png");
+        let target = StartupTarget::resolve(&image).unwrap();
+        assert_eq!(target.root, root.canonicalize().unwrap());
+        let mut browser = Browser::new(
+            target.root,
+            Picker::halfblocks(),
+            "Half 1x2/forced".into(),
+            RuntimeSettings::load(&ConfigSource::Disabled, &CliOverrides::default()).unwrap(),
+            true,
+            None,
+            KittySession::with_tmux(false),
+        );
+        let (path, revision) = target.image.unwrap();
+        browser.open_startup_image(path.clone(), revision);
+        assert!(matches!(browser.view, BrowserView::Inspect(_)));
+        assert_eq!(browser.app.entries.len(), 1);
+        assert_eq!(browser.app.selected_entry().unwrap().path.as_ref(), path);
+
+        // Capture the real scanner's complete batch with a bounded timeout,
+        // then replay it deterministically through the normal background drain.
+        let (sender, receiver) = mpsc::sync_channel(8);
+        loop {
+            let event = browser
+                .scanner
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            let done = matches!(event, ScanEvent::Done);
+            sender.send(event).unwrap();
+            if done {
+                break;
+            }
+        }
+        browser.scanner = receiver;
+        browser.drain_background_work();
+        assert!(browser.app.scan_done);
+        assert_eq!(browser.app.entries.len(), 3);
+        assert_eq!(browser.app.selected_entry().unwrap().path.as_ref(), path);
+        browser.handle_inspect_action(Some(Action::CloseInspect));
+        assert!(matches!(browser.view, BrowserView::Grid));
+        assert_eq!(browser.app.selected_entry().unwrap().path.as_ref(), path);
+        browser.handle_normal_action(Some(Action::MoveRight));
+        assert_ne!(browser.app.selected_entry().unwrap().path.as_ref(), path);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_resolves_directories_and_rejects_missing_or_unsupported_paths() {
+        let (browser, root) = browser_with_images();
+        let target = StartupTarget::resolve(&root).unwrap();
+        assert_eq!(target.root, root.canonicalize().unwrap());
+        assert!(target.image.is_none());
+        assert!(StartupTarget::resolve(&root.join("missing.png")).is_err());
+        let text = root.join("notes.txt");
+        fs::write(&text, "not an image").unwrap();
+        let error = StartupTarget::resolve(&text).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("not a supported image or directory")
+        );
+        drop(browser);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_canonicalizes_image_symlinks_and_accepts_non_utf8_names() {
+        use std::os::unix::{ffi::OsStringExt, fs::symlink};
+        let (browser, root) = browser_with_images();
+        let image = root.join(std::ffi::OsString::from_vec(b"photo-\xff.PNG".to_vec()));
+        fs::write(&image, b"image").unwrap();
+        let link = root.join("shortcut.png");
+        symlink(&image, &link).unwrap();
+        let target = StartupTarget::resolve(&link).unwrap();
+        assert_eq!(target.image.unwrap().0, image.canonicalize().unwrap());
+        assert_eq!(target.root, root.canonicalize().unwrap());
+        drop(browser);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

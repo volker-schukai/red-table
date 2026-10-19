@@ -3,6 +3,7 @@ mod app;
 mod browser;
 mod cli;
 mod config;
+pub mod diagnostics;
 mod graphics;
 mod image_source;
 mod inspection;
@@ -11,6 +12,7 @@ mod path_io;
 mod persistent_cache;
 mod scan;
 mod settings;
+mod shell;
 mod terminal;
 mod thumbnails;
 mod ui;
@@ -22,9 +24,14 @@ pub type BoxError = Box<dyn Error + Send + Sync>;
 pub const HELP: &str = "red-table - a performance-first terminal image browser
 
 Usage: red-table [OPTIONS] [PATH]
+       red-table shell-init <bash|zsh|fish>
+
+Commands:
+  shell-init SHELL  Print completion and Alt+i image-picker integration
+                    (use -- shell-init to browse a directory named shell-init)
 
 Arguments:
-  [PATH]           Directory to browse (default: current directory)
+  [PATH]           Directory to browse or image to inspect (default: current directory)
 
 Options:
   -s, --thumbnail-size WIDTHxHEIGHT
@@ -90,6 +97,11 @@ where
     I: IntoIterator<Item = OsString>,
 {
     match cli::parse(arguments)? {
+        cli::Command::ShellInit(shell) => {
+            use io::Write;
+            io::stdout().lock().write_all(shell.script().as_bytes())?;
+            Ok(RunOutcome::Completed)
+        }
         cli::Command::Help => {
             print!("{HELP}");
             Ok(RunOutcome::Completed)

@@ -5,6 +5,7 @@ use crate::{
     config::{CliOverrides, ConfigSource},
     graphics::GraphicsProtocol,
     settings::{ThumbnailQuality, ThumbnailSize},
+    shell::Shell,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -22,13 +23,31 @@ pub(crate) enum Command {
     Browse(BrowseOptions),
     Help,
     Version,
+    ShellInit(Shell),
 }
 
 pub(crate) fn parse<I>(arguments: I) -> Result<Command, BoxError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut arguments = arguments.into_iter();
+    let mut arguments = arguments.into_iter().peekable();
+    if arguments
+        .peek()
+        .is_some_and(|argument| argument == "shell-init")
+    {
+        arguments.next();
+        let shell = arguments
+            .next()
+            .ok_or("shell-init requires bash, zsh, or fish")?;
+        if shell == "--help" || shell == "-h" {
+            return Ok(Command::Help);
+        }
+        let shell = Shell::parse(&shell)?;
+        if arguments.next().is_some() {
+            return Err("shell-init accepts exactly one shell: bash, zsh, or fish".into());
+        }
+        return Ok(Command::ShellInit(shell));
+    }
     let mut path = None;
     let mut overrides = CliOverrides::default();
     let mut config_source = ConfigSource::Discover;
@@ -168,7 +187,7 @@ where
             return Err(format!("unknown option: {}", argument.to_string_lossy()).into());
         }
         if path.replace(PathBuf::from(&argument)).is_some() {
-            return Err("only one directory may be specified".into());
+            return Err("only one path may be specified".into());
         }
     }
 
@@ -176,7 +195,7 @@ where
         return Err("--print0 requires --select".into());
     }
     if files0_from_stdin && path.is_some() {
-        return Err("--files0-from may not be combined with a directory path".into());
+        return Err("--files0-from may not be combined with a positional path".into());
     }
 
     Ok(Command::Browse(BrowseOptions {
@@ -213,6 +232,19 @@ fn parse_thumbnail_size(value: &OsString) -> Result<ThumbnailSize, BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_init_is_an_explicit_command_and_double_dash_keeps_its_path_available() {
+        assert_eq!(
+            parse(["shell-init", "bash"].map(OsString::from)).unwrap(),
+            Command::ShellInit(Shell::Bash)
+        );
+        let Command::Browse(options) = parse(["--", "shell-init"].map(OsString::from)).unwrap()
+        else {
+            panic!("expected browsing")
+        };
+        assert_eq!(options.path, PathBuf::from("shell-init"));
+    }
 
     #[test]
     fn defaults_to_current_directory() {

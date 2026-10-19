@@ -61,6 +61,9 @@ tasks:
       - alejandra --check .
       - stylua --check red-table.yazi tests/yazi_plugin.lua tests/yazi-smoke/init.lua
       - bash -n tests/yazi_plugin_smoke.sh tests/yazi-smoke/red-table-wrapper.sh
+      - bash -n source/shell/bash.bash
+      - zsh -n source/shell/zsh.zsh
+      - fish -n source/shell/fish.fish
 
   lint:
     desc: Reject Rust compiler and Clippy warnings

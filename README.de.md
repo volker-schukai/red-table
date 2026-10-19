@@ -43,6 +43,18 @@ nix build
 nix run . -- /pfad/zu/bildern
 ```
 
+Ein Bildpfad öffnet direkt die Einzelansicht, während das übergeordnete
+Verzeichnis im Hintergrund geladen wird:
+
+```sh
+nix run . -- /pfad/zu/bildern/bild.png
+```
+
+Mit `Esc` geht es zur Thumbnail-Übersicht, mit `p`/`n` zu benachbarten Bildern.
+Fehler erscheinen mit Hilfestellung auf stderr und farbigen Beschriftungen,
+wenn das Terminal dies unterstützt. Bei Umleitung, `TERM=dumb` oder gesetztem,
+nicht leerem `NO_COLOR` bleibt die Ausgabe ohne Farbe.
+
 Eine bevorzugte Thumbnail-Größe kann beim Start angegeben werden:
 
 ```sh
@@ -125,6 +137,34 @@ Damit stdout sauber bleibt, überspringt `--select` die aktive, Escape-Sequenzen
 sendende Protokollabfrage. Abgesicherte Terminal-Umgebungsmerkmale erkennen
 direktes Kitty/iTerm2 weiterhin; bei Bedarf setzt `--graphics-protocol` den
 Renderer ausdrücklich.
+
+## Shell-Integration
+
+Tab-Vervollständigung und die Bildauswahl mit `Alt+i` werden in der Startdatei
+der jeweiligen Shell aktiviert:
+
+```bash
+# ~/.bashrc
+eval "$(red-table shell-init bash)"
+```
+
+```zsh
+# ~/.zshrc, nach compinit
+eval "$(red-table shell-init zsh)"
+```
+
+```fish
+# ~/.config/fish/config.fish
+red-table shell-init fish | source
+```
+
+`Alt+i` öffnet die Bildauswahl im aktuellen Verzeichnis und fügt die ausgewählten
+Pfade mit passender Shell-Quotierung am Cursor ein. Space markiert, Ctrl+s
+bestätigt; `q` bricht ab und lässt die Befehlszeile unverändert. Das Kürzel wird
+zwischen Argumenten verwendet, wenn der Text vor dem Cursor vollständig und
+außerhalb offener Anführungszeichen ist. Weitere Einrichtungshinweise und eigene
+Tastenkürzel beschreibt das [Handbuch](documentation/user-manual/de/erste-schritte.md#shell-integration).
+Der Befehl gibt Skripte aus und ändert keine Startdateien.
 
 ## Yazi-Plugin
 

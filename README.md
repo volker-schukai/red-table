@@ -43,6 +43,17 @@ nix build
 nix run . -- /path/to/photos
 ```
 
+Pass an image path to open it fullscreen while its parent directory loads in
+the background:
+
+```sh
+nix run . -- /path/to/photos/image.png
+```
+
+Press `Esc` for the surrounding thumbnail grid or `p`/`n` for adjacent images.
+Errors include recovery hints on stderr. Diagnostic labels use color on capable
+terminals; redirected output, `TERM=dumb`, and nonempty `NO_COLOR` disable it.
+
 Choose a preferred thumbnail cell size at startup:
 
 ```sh
@@ -121,6 +132,32 @@ find ./photos -type f -print0 |
 To keep stdout pristine, `--select` skips the active escape-sequence capability
 probe. Guarded terminal environment hints still select direct Kitty/iTerm2, and
 `--graphics-protocol` remains available when an explicit renderer is required.
+
+## Shell integration
+
+Enable Tab completion and the `Alt+i` image picker in your shell startup file:
+
+```bash
+# ~/.bashrc
+eval "$(red-table shell-init bash)"
+```
+
+```zsh
+# ~/.zshrc, after compinit
+eval "$(red-table shell-init zsh)"
+```
+
+```fish
+# ~/.config/fish/config.fish
+red-table shell-init fish | source
+```
+
+`Alt+i` selects images from the current directory and inserts their quoted paths
+at the cursor. Mark with Space, confirm with Ctrl+s; `q` cancels without changing
+the command line. Use it between arguments with a complete, unquoted command
+prefix. See the [shell integration guide](documentation/user-manual/en/getting-started.md#shell-integration)
+for setup and custom bindings. The command prints scripts; it does not edit your
+startup files.
 
 ## Yazi plugin
 

@@ -24,6 +24,7 @@
           version = projectVersion;
           src = pkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          nativeCheckInputs = with pkgs; [bashInteractive coreutils expect fish zsh];
 
           meta = {
             description = "Fast, keyboard-driven terminal image browser";
@@ -90,6 +91,7 @@
             docs
             expect
             ffmpeg-full
+            fish
             figlet
             findutils
             git
@@ -111,6 +113,7 @@
             xdotool
             xorg-server
             yazi
+            zsh
           ];
 
           RUST_BACKTRACE = "1";
