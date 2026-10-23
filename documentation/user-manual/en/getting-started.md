@@ -58,6 +58,20 @@ CLI errors appear on stderr with an error label and recovery hint. Labels use
 color when stderr is a capable terminal. Redirected stderr, an unset or empty
 `TERM`, `TERM=dumb`, or nonempty `NO_COLOR` disable diagnostic color.
 
+## External image edits
+
+Images reload automatically after another program saves changes to the same
+path. red-table checks the current grid viewport and its prefetch rows, the
+fullscreen image, or both A/B panes approximately once per second in the
+background. Focus, marks, filters, ordering, zoom, and pan remain in place.
+Images outside that working set are checked when you return to them.
+
+Overwrites and atomic file replacements are supported. Temporarily missing or
+unreadable files keep their last known revision and are checked again. A partial
+save can briefly show a decode error; a subsequent file change triggers a retry.
+Detection uses file size and modification time, so edits preserving both are
+not detected. New files are discovered only during the initial scan.
+
 ## Configuration
 
 Optional strict TOML configuration is discovered at

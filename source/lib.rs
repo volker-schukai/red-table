@@ -10,6 +10,7 @@ mod inspection;
 mod kitty;
 mod path_io;
 mod persistent_cache;
+mod refresh;
 mod scan;
 mod settings;
 mod shell;

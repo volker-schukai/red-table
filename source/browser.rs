@@ -16,6 +16,7 @@ use crate::{
     graphics,
     inspection::{DecodedSources, Inspection, InspectionDisplay, InspectionKey, ViewState},
     kitty::KittySession,
+    refresh::{RevisionCheck, RevisionMonitor},
     scan::{self, ScanEvent},
     settings::{BackgroundMode, DEFAULT_THUMBNAIL_SIZE, ThumbnailQuality, ThumbnailSize},
     terminal::{AppTerminal, TerminalSession, TerminalTarget},
@@ -30,8 +31,9 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// the second nudge covers slow renderers.
 const REPAINT_NUDGE_DELAYS: [Duration; 2] = [Duration::from_millis(50), Duration::from_millis(300)];
 /// Poll interval while no scan, thumbnail, inspection, or cleanup work is
-/// pending; only input and resize events need to wake the loop.
+/// pending; this also wakes the loop to schedule source revision checks.
 const IDLE_INTERVAL: Duration = Duration::from_millis(250);
+const REVISION_INTERVAL: Duration = Duration::from_secs(1);
 const PREFETCH_ROWS: usize = 1;
 
 pub(crate) enum BrowseOutcome {
@@ -136,6 +138,8 @@ fn close(
 struct Browser {
     app: App,
     scanner: mpsc::Receiver<ScanEvent>,
+    revisions: RevisionMonitor,
+    next_revision_check: Instant,
     thumbnails: Thumbnails,
     kitty_session: KittySession,
     inspection: Inspection,
@@ -255,6 +259,8 @@ impl Browser {
                 None => scan::start(root.clone()),
             },
             app: App::new(root),
+            revisions: RevisionMonitor::new(),
+            next_revision_check: Instant::now(),
             thumbnails: Thumbnails::with_session(picker, kitty_session.clone()),
             kitty_session,
             inspection,
@@ -295,6 +301,7 @@ impl Browser {
         while self.running {
             let frame_started = Instant::now();
             dirty |= self.drain_background_work();
+            self.schedule_revision_check(frame_started);
             dirty |= self.kitty_session.drain_cleanup(terminal.backend_mut())? > 0;
             self.write_due_repaint_nudges(terminal.backend_mut(), frame_started)?;
             if dirty {
@@ -470,11 +477,50 @@ impl Browser {
             }
             changed |= self.app.integrate_pending();
         }
+        for change in self.revisions.drain() {
+            changed |= self
+                .app
+                .update_revision(change.id, change.previous, change.current);
+        }
         let (completed, errors) = self.thumbnails.drain();
         self.app.thumbnail_errors += errors;
         let inspection_changed = self.inspection.drain();
         let comparison_changed = self.comparison_inspection.drain();
         changed || completed > 0 || inspection_changed || comparison_changed
+    }
+
+    fn revision_checks(&self) -> Vec<RevisionCheck> {
+        let ids = match self.view {
+            BrowserView::Grid => self
+                .app
+                .viewport_entry_ids(self.grid.columns, self.grid.rows, PREFETCH_ROWS)
+                .collect::<Vec<_>>(),
+            BrowserView::Inspect(_) => self
+                .app
+                .selected_entry()
+                .map(|entry| entry.id)
+                .into_iter()
+                .collect(),
+            BrowserView::Compare(state) => std::iter::once(state.reference_id)
+                .chain(self.app.selected_entry().map(|entry| entry.id))
+                .collect(),
+        };
+        ids.into_iter()
+            .filter_map(|id| self.app.entry(id))
+            .map(|entry| RevisionCheck {
+                id: entry.id,
+                path: entry.path.clone(),
+                previous: entry.revision,
+            })
+            .collect()
+    }
+
+    fn schedule_revision_check(&mut self, now: Instant) {
+        if now < self.next_revision_check || self.revisions.is_pending() {
+            return;
+        }
+        self.revisions.request(self.revision_checks());
+        self.next_revision_check = now + REVISION_INTERVAL;
     }
 
     fn schedule_work(&mut self) -> bool {
@@ -1009,6 +1055,176 @@ mod tests {
         browser.grid.columns = 2;
         browser.grid.rows = 1;
         (browser, root)
+    }
+
+    #[test]
+    fn revision_monitoring_is_limited_to_the_active_working_set() {
+        let (mut browser, root) = browser_with_images();
+        for index in 3..10_000 {
+            browser
+                .app
+                .add_path(root.join(format!("{index}.png")), SourceRevision::default());
+        }
+        browser.app.integrate_pending();
+        browser.app.selected = 5000;
+        browser.app.ensure_visible(2, 1);
+        let checks = browser.revision_checks();
+        assert!(checks.len() <= 2 * (1 + 2 * PREFETCH_ROWS));
+        assert!(checks.iter().any(|check| check.id == EntryId(5000)));
+        browser.handle_normal_action(Some(Action::OpenInspect));
+        let checks = browser.revision_checks();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].id, EntryId(5000));
+        browser.handle_inspect_action(Some(Action::CloseInspect));
+        browser.start_comparison();
+        let checks = browser.revision_checks();
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].id, EntryId(5000));
+        assert_eq!(checks[1].id, EntryId(5001));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn wait_for_browser(browser: &mut Browser, mut complete: impl FnMut(&mut Browser) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            browser.drain_background_work();
+            browser.schedule_work();
+            if complete(browser) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "background refresh timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn prepared_color(prepared: &crate::thumbnails::PreparedThumbnail) -> ratatui::style::Color {
+        use crate::thumbnails::PreparedThumbnail;
+        use ratatui::{Terminal, backend::TestBackend};
+        let PreparedThumbnail::Standard(protocol) = prepared else {
+            panic!("expected halfblocks");
+        };
+        let mut terminal = Terminal::new(TestBackend::new(8, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(ratatui_image::Image::new(protocol), frame.area());
+            })
+            .unwrap();
+        terminal.backend().buffer()[(4, 2)].fg
+    }
+
+    fn inspection_color(
+        inspection: &Inspection,
+        key: Option<InspectionKey>,
+    ) -> Option<ratatui::style::Color> {
+        match inspection.display(key?) {
+            InspectionDisplay::Ready(prepared) => Some(prepared_color(prepared)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn external_edits_reload_grid_inspection_and_both_comparison_panes() {
+        use crate::thumbnails::ThumbnailDisplay;
+        use image::{Rgb, RgbImage};
+        use ratatui::{layout::Size, style::Color};
+
+        let (mut browser, root) = browser_with_images();
+        // Isolate this test's known entries from the concurrent startup scanner.
+        browser.app.scan_done = true;
+        let paths = [root.join("1-one.png"), root.join("2-two.png")];
+        let save = |path: &std::path::Path, color, seconds| {
+            RgbImage::from_pixel(16, 16, Rgb(color)).save(path).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+                .unwrap();
+        };
+        save(&paths[0], [255, 0, 0], 42);
+        save(&paths[1], [255, 0, 0], 42);
+        for path in &paths {
+            browser
+                .app
+                .add_path(path.clone(), scan::revision_for(path).unwrap());
+        }
+        browser.app.filtered.truncate(2);
+        browser.grid.image_size = Size::new(8, 4);
+        browser.inspection_size = Size::new(8, 4);
+        browser.comparison_size = Size::new(8, 4);
+        browser.app.toggle_mark();
+        let grid_color = |browser: &mut Browser| {
+            let entry = browser.app.selected_entry().unwrap();
+            let key = ThumbnailKey {
+                entry_id: entry.id,
+                revision: entry.revision,
+                size: browser.grid.image_size,
+                quality: browser.thumbnail_quality,
+            };
+            match browser.thumbnails.display(key) {
+                ThumbnailDisplay::Ready(prepared) => Some(prepared_color(prepared)),
+                _ => None,
+            }
+        };
+        wait_for_browser(&mut browser, |browser| {
+            grid_color(browser) == Some(Color::Rgb(255, 0, 0))
+        });
+        browser.handle_normal_action(Some(Action::OpenInspect));
+        wait_for_browser(&mut browser, |browser| {
+            inspection_color(&browser.inspection, browser.inspection_key)
+                == Some(Color::Rgb(255, 0, 0))
+        });
+        browser.handle_inspect_action(Some(Action::ZoomIn));
+        let view_before = format!("{:?}", browser.view);
+        save(&paths[0], [0, 0, 255], 43);
+        let poll_at = Instant::now();
+        browser.next_revision_check = poll_at;
+        browser.schedule_revision_check(poll_at);
+        assert_eq!(browser.next_revision_check, poll_at + REVISION_INTERVAL);
+        wait_for_browser(&mut browser, |browser| {
+            inspection_color(&browser.inspection, browser.inspection_key)
+                == Some(Color::Rgb(0, 0, 255))
+        });
+        assert_eq!(format!("{:?}", browser.view), view_before);
+        assert!(browser.app.is_marked(EntryId(0)));
+        assert_eq!(browser.app.selected_entry().unwrap().id, EntryId(0));
+        browser.handle_inspect_action(Some(Action::CloseInspect));
+        wait_for_browser(&mut browser, |browser| {
+            grid_color(browser) == Some(Color::Rgb(0, 0, 255))
+        });
+
+        browser.start_comparison();
+        wait_for_browser(&mut browser, |browser| {
+            inspection_color(&browser.inspection, browser.inspection_key)
+                == Some(Color::Rgb(0, 0, 255))
+                && inspection_color(&browser.comparison_inspection, browser.comparison_key)
+                    == Some(Color::Rgb(255, 0, 0))
+        });
+        let comparison_before = format!("{:?}", browser.view);
+        save(&paths[0], [0, 255, 0], 44);
+        fs::write(&paths[1], b"partially saved PNG").unwrap();
+        browser.schedule_revision_check(poll_at + REVISION_INTERVAL);
+        wait_for_browser(&mut browser, |browser| {
+            inspection_color(&browser.inspection, browser.inspection_key)
+                == Some(Color::Rgb(0, 255, 0))
+                && matches!(
+                    browser
+                        .comparison_key
+                        .map(|key| browser.comparison_inspection.display(key)),
+                    Some(InspectionDisplay::Error(_))
+                )
+        });
+        save(&paths[1], [255, 255, 0], 45);
+        browser.schedule_revision_check(poll_at + REVISION_INTERVAL * 2);
+        wait_for_browser(&mut browser, |browser| {
+            inspection_color(&browser.comparison_inspection, browser.comparison_key)
+                == Some(Color::Rgb(255, 255, 0))
+        });
+        assert_eq!(format!("{:?}", browser.view), comparison_before);
+        assert!(browser.app.is_marked(EntryId(0)));
+        assert_eq!(browser.app.selected_entry().unwrap().id, EntryId(1));
+        drop(browser);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -62,6 +62,23 @@ Die Beschriftungen sind farbig, wenn stderr ein geeignetes Terminal ist.
 Umgeleitetes stderr, fehlendes oder leeres `TERM`, `TERM=dumb` und nicht leeres
 `NO_COLOR` schalten diese Farben ab.
 
+## Externe Bildänderungen
+
+Speichert ein anderes Programm Änderungen unter demselben Pfad, lädt red-table
+das Bild automatisch neu. Dafür werden die Bilder im aktuellen Rasterausschnitt
+samt vorgeladenen Zeilen, das Bild in der Großansicht oder beide A/B-Seiten etwa
+einmal pro Sekunde im Hintergrund geprüft. Fokus, Markierungen, Suchfilter,
+Sortierung, Zoom und Ausschnitt bleiben erhalten. Andere Bilder werden geprüft,
+sobald du zu ihnen zurückkehrst.
+
+Das funktioniert beim Überschreiben und beim atomaren Ersetzen einer Datei.
+Fehlt sie vorübergehend oder ist sie nicht lesbar, bleibt die zuletzt bekannte
+Version erhalten und red-table prüft erneut. Während des Speicherns kann kurz
+ein Decode-Fehler erscheinen; eine weitere Dateiänderung löst einen neuen
+Ladeversuch aus. Die Erkennung nutzt Dateigröße und Änderungszeit. Bleiben beide
+gleich, wird die Änderung nicht erkannt. Neue Dateien werden nur beim ersten
+Scan gefunden.
+
 ## Konfiguration
 
 Eine optionale, streng geprüfte TOML-Konfiguration wird unter

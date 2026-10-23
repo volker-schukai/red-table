@@ -129,6 +129,23 @@ impl App {
         id
     }
 
+    /// Apply a metadata observation only while its request is still current.
+    pub(crate) fn update_revision(
+        &mut self,
+        id: EntryId,
+        previous: SourceRevision,
+        current: SourceRevision,
+    ) -> bool {
+        let Some(entry) = self.entry_mut(id) else {
+            return false;
+        };
+        if entry.revision != previous || previous == current {
+            return false;
+        }
+        entry.revision = current;
+        true
+    }
+
     /// Merges entries added since the last call into the display order and the
     /// visible filter in linear time, preserving focus identity.
     pub(crate) fn integrate_pending(&mut self) -> bool {
@@ -571,6 +588,36 @@ mod tests {
         assert!(!app.integrate_pending());
         assert_eq!(app.entry(id).unwrap().revision, changed);
         assert_eq!(app.entries.len(), 2);
+    }
+
+    #[test]
+    fn revision_observations_cannot_overwrite_newer_entry_state() {
+        let mut app = app_with_images(&["one.jpg", "two.jpg"]);
+        app.selected = 1;
+        app.toggle_mark();
+        app.toggle_sort();
+        app.start_search();
+        app.push_search('t');
+        let id = app.selected_entry().unwrap().id;
+        let old = app.entry(id).unwrap().revision;
+        let current = SourceRevision {
+            size: 42,
+            modified_nanoseconds: 7,
+        };
+        let newer = SourceRevision {
+            size: 43,
+            modified_nanoseconds: 8,
+        };
+        assert!(app.update_revision(id, old, current));
+        assert!(app.update_revision(id, current, newer));
+        assert!(!app.update_revision(id, old, current));
+        assert!(!app.update_revision(id, newer, newer));
+        assert!(!app.update_revision(EntryId(999), old, newer));
+        assert_eq!(app.selected_entry().unwrap().id, id);
+        assert_eq!(app.entry(id).unwrap().revision, newer);
+        assert!(app.is_marked(id));
+        assert_eq!(app.query, "t");
+        assert_eq!(app.order, EntryOrder::Path);
     }
 
     #[test]
