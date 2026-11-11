@@ -1,6 +1,6 @@
 [package]
 name = "red-table"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "A fast, keyboard-driven terminal image browser"
 license = "MIT"
@@ -24,6 +24,18 @@ name = "persistent_cache"
 harness = false
 
 [[bench]]
+name = "inspection_stages"
+harness = false
+
+[[bench]]
+name = "scan_intake"
+harness = false
+
+[[bench]]
+name = "simd_resize"
+harness = false
+
+[[bench]]
 name = "kitty_protocol"
 harness = false
 
@@ -42,19 +54,19 @@ harness = false
 [profile.release]
 codegen-units = 1
 lto = "thin"
-panic = "abort"
 strip = "symbols"
 
 [dependencies]
 base64-simd = "=0.8.0"
 crossterm = { version = "0.29.0", default-features = false, features = ["events"] }
-flate2 = "=1.1.10"
+fast_image_resize = { version = "=6.1.0", features = ["image"] }
+flate2 = "=1.1.11"
 ignore = "0.4.23"
-image = { version = "=0.25.9", default-features = false, features = ["jpeg", "png", "gif", "webp", "tiff", "bmp"] }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp", "tiff", "bmp"] }
 md5 = "0.8.0"
 png = "=0.18.1"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 serde = { version = "=1.0.229", features = ["derive"] }
-toml = "=1.1.4"
+toml = "=1.2.1"
 url = "2.5.7"

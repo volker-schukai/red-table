@@ -100,20 +100,23 @@ mit den eingebauten Werten.
 - `F12`: Renderer-, Qualitäts-, Queue- und Cache-Diagnose umschalten
 - `q`: beenden; Escape schließt nur die aktive Unteransicht oder bricht sie ab
 
-In der Großansicht wechseln `p` / `n` zum vorherigen / nächsten Treffer. `z`
-schaltet zwischen Einpassen und exakten 100 Prozent um, `+` / `-` durchlaufen
-die begrenzten Zoomstufen von 25 bis 800 Prozent. Pfeile beziehungsweise
-`h`, `j`, `k`, `l` verschieben den Ausschnitt; `b` wechselt den Hintergrund für
-Transparenz zwischen Schachbrett, dunkel und hell. EXIF-Ausrichtung wird vor der
-Darstellung angewendet; Decoding und Ausschnittberechnung blockieren die Eingabe
-nicht.
+In der Großansicht wechseln `p` / `n` oder Bild ↑ / Bild ↓ zum vorherigen /
+nächsten Treffer. `z` schaltet zwischen Einpassen und exakten 100 Prozent um,
+`+` / `-` durchlaufen die begrenzten Zoomstufen von 25 bis 800 Prozent.
+Eingepasst wechseln auch ← / → zum vorherigen / nächsten Bild; gezoomt
+verschieben Pfeile beziehungsweise `h`, `j`, `k`, `l` den Ausschnitt; `b`
+wechselt den Hintergrund für Transparenz zwischen Schachbrett, dunkel und hell.
+EXIF-Ausrichtung wird vor der Darstellung angewendet; Decoding und
+Ausschnittberechnung blockieren die Eingabe nicht. Ein Filmstreifen mit den
+benachbarten Bildern läuft unter dem Bild; `t` blendet ihn aus und ein.
 
-Im A/B-Vergleich bleibt die linke `REFERENZ` fest, während `p` / `n` den rechten
-`KANDIDATEN` wechseln. Enter macht den Kandidaten zur Referenz und setzt den
-Vergleich mit einem weiteren Bild fort. Tab wählt die aktive Seite; die Leertaste
-markiert deren Bild. `s` schaltet zwischen gekoppeltem und unabhängigem Zoom und
-Ausschnitt um. Gekoppelt bleiben normalisierte Mitte und Zoomstufe auch bei
-unterschiedlichen Bildmaßen gleich. Escape führt zurück zum Raster.
+Im A/B-Vergleich bleibt die linke `REFERENZ` fest, während `p` / `n` oder Bild ↑
+/ Bild ↓ den rechten `KANDIDATEN` wechseln. Enter macht den Kandidaten zur
+Referenz und setzt den Vergleich mit einem weiteren Bild fort. Tab wählt die
+aktive Seite; die Leertaste markiert deren Bild. `s` schaltet zwischen
+gekoppeltem und unabhängigem Zoom und Ausschnitt um. Gekoppelt bleiben
+normalisierte Mitte und Zoomstufe auch bei unterschiedlichen Bildmaßen gleich.
+Escape führt zurück zum Raster.
 
 Als visueller Dateifilter lässt sich red-table so verwenden:
 
@@ -123,10 +126,11 @@ nix run . -- --select --print0 /pfad/zu/bildern > auswahl.paths0
 
 Die Oberfläche schreibt ausschließlich nach `/dev/tty`; nur bestätigte absolute
 Pfade landen auf stdout. Die NUL-Trennung bewahrt beliebige Unix-Dateinamen und
-eignet sich für `xargs -0`. Ohne `--print0` wird zur besseren Lesbarkeit ein Pfad
-je Zeile ausgegeben. `q` bricht ohne Ausgabe mit Status 2 ab, Strg+s bestätigt
-auch eine leere Auswahl erfolgreich. Eine NUL-getrennte
-Dateiliste kann anstelle eines Ordners übergeben werden:
+eignet sich für `xargs -0`. Ohne `--print0` wird zur besseren Lesbarkeit ein
+Pfad je Zeile ausgegeben; im Terminal erscheinen Steuerzeichen maskiert, und ein
+Pfad mit Zeilenumbruch wird ohne `--print0` abgelehnt. `q` bricht ohne Ausgabe
+mit Status 2 ab, Strg+s bestätigt auch eine leere Auswahl erfolgreich. Eine
+NUL-getrennte Dateiliste kann anstelle eines Ordners übergeben werden:
 
 ```sh
 find ./bilder -type f -print0 |

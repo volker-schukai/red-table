@@ -57,10 +57,10 @@ where
     let mut options_ended = false;
 
     while let Some(argument) = arguments.next() {
-        if argument == "-h" || argument == "--help" {
+        if !options_ended && (argument == "-h" || argument == "--help") {
             return Ok(Command::Help);
         }
-        if argument == "-V" || argument == "--version" {
+        if !options_ended && (argument == "-V" || argument == "--version") {
             return Ok(Command::Version);
         }
         if !options_ended && argument == "--" {
@@ -296,6 +296,18 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn help_and_version_names_after_double_dash_are_paths() {
+        for name in ["-h", "--help", "-V", "--version"] {
+            let Command::Browse(options) = parse(["--", name].map(OsString::from)).unwrap() else {
+                panic!("`-- {name}` must browse");
+            };
+            assert_eq!(options.path, std::path::PathBuf::from(name));
+        }
+        assert_eq!(parse([OsString::from("--help")]).unwrap(), Command::Help);
+        assert_eq!(parse([OsString::from("-V")]).unwrap(), Command::Version);
     }
 
     #[test]

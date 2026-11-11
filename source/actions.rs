@@ -41,9 +41,12 @@ pub(crate) enum Action {
     ZoomOut,
     PanLeft,
     PanRight,
+    PreviousOrPanLeft,
+    NextOrPanRight,
     PanUp,
     PanDown,
     CycleBackground,
+    ToggleFilmstrip,
     ToggleMark,
     MarkRange,
     ClearMarks,
@@ -95,9 +98,12 @@ impl Action {
             "zoom_out" => Ok(Self::ZoomOut),
             "pan_left" => Ok(Self::PanLeft),
             "pan_right" => Ok(Self::PanRight),
+            "previous_or_pan_left" => Ok(Self::PreviousOrPanLeft),
+            "next_or_pan_right" => Ok(Self::NextOrPanRight),
             "pan_up" => Ok(Self::PanUp),
             "pan_down" => Ok(Self::PanDown),
             "background" => Ok(Self::CycleBackground),
+            "filmstrip" => Ok(Self::ToggleFilmstrip),
             "toggle_mark" => Ok(Self::ToggleMark),
             "mark_range" => Ok(Self::MarkRange),
             "clear_marks" => Ok(Self::ClearMarks),
@@ -151,9 +157,12 @@ impl Action {
             Self::ZoomOut => "zoom out",
             Self::PanLeft => "pan left",
             Self::PanRight => "pan right",
+            Self::PreviousOrPanLeft => "previous image (fit) / pan left",
+            Self::NextOrPanRight => "next image (fit) / pan right",
             Self::PanUp => "pan up",
             Self::PanDown => "pan down",
             Self::CycleBackground => "transparency background",
+            Self::ToggleFilmstrip => "filmstrip",
             Self::ToggleMark => "mark / unmark image",
             Self::MarkRange => "mark anchored range",
             Self::ClearMarks => "clear all marks",
@@ -370,20 +379,35 @@ impl Bindings {
             ),
             (ActionContext::Inspect, Action::Quit, &["q"][..]),
             (ActionContext::Inspect, Action::CloseInspect, &["Esc"][..]),
-            (ActionContext::Inspect, Action::PreviousImage, &["p"][..]),
-            (ActionContext::Inspect, Action::NextImage, &["n"][..]),
+            (
+                ActionContext::Inspect,
+                Action::PreviousImage,
+                &["p", "PageUp"][..],
+            ),
+            (
+                ActionContext::Inspect,
+                Action::NextImage,
+                &["n", "PageDown"][..],
+            ),
             (ActionContext::Inspect, Action::ToggleFitHundred, &["z"][..]),
             (ActionContext::Inspect, Action::ZoomIn, &["+"][..]),
             (ActionContext::Inspect, Action::ZoomOut, &["-"][..]),
-            (ActionContext::Inspect, Action::PanLeft, &["Left", "h"][..]),
+            (ActionContext::Inspect, Action::PanLeft, &["h"][..]),
+            (ActionContext::Inspect, Action::PanRight, &["l"][..]),
             (
                 ActionContext::Inspect,
-                Action::PanRight,
-                &["Right", "l"][..],
+                Action::PreviousOrPanLeft,
+                &["Left"][..],
+            ),
+            (
+                ActionContext::Inspect,
+                Action::NextOrPanRight,
+                &["Right"][..],
             ),
             (ActionContext::Inspect, Action::PanUp, &["Up", "k"][..]),
             (ActionContext::Inspect, Action::PanDown, &["Down", "j"][..]),
             (ActionContext::Inspect, Action::CycleBackground, &["b"][..]),
+            (ActionContext::Inspect, Action::ToggleFilmstrip, &["t"][..]),
             (ActionContext::Inspect, Action::ToggleHelp, &["?"][..]),
             (ActionContext::Inspect, Action::ToggleDebug, &["F12"][..]),
             (ActionContext::Inspect, Action::ToggleMark, &["Space"][..]),
@@ -397,8 +421,16 @@ impl Bindings {
             ),
             (ActionContext::Compare, Action::Quit, &["q"][..]),
             (ActionContext::Compare, Action::CloseInspect, &["Esc"][..]),
-            (ActionContext::Compare, Action::PreviousImage, &["p"][..]),
-            (ActionContext::Compare, Action::NextImage, &["n"][..]),
+            (
+                ActionContext::Compare,
+                Action::PreviousImage,
+                &["p", "PageUp"][..],
+            ),
+            (
+                ActionContext::Compare,
+                Action::NextImage,
+                &["n", "PageDown"][..],
+            ),
             (
                 ActionContext::Compare,
                 Action::PromoteCandidate,
@@ -468,6 +500,36 @@ impl Bindings {
             }
             map.insert(key, action);
         }
+        Ok(())
+    }
+
+    /// Applies one context's user bindings as a batch: configured actions drop
+    /// their built-in keys, configured keys displace built-in bindings, and only
+    /// two configured actions sharing a key are a conflict.
+    pub(crate) fn configure_context(
+        &mut self,
+        context: ActionContext,
+        configured: Vec<(Action, Vec<KeyChord>)>,
+    ) -> Result<(), String> {
+        let mut assigned = HashMap::new();
+        for (action, keys) in &configured {
+            for key in keys {
+                if let Some(existing) = assigned.insert(key.clone(), *action)
+                    && existing != *action
+                {
+                    return Err(format!(
+                        "key `{key}` is bound to both {} and {} in {context:?}",
+                        existing.label(),
+                        action.label()
+                    ));
+                }
+            }
+        }
+        let map = self.by_context.entry(context).or_default();
+        map.retain(|key, existing| {
+            !assigned.contains_key(key) && !configured.iter().any(|(action, _)| action == existing)
+        });
+        map.extend(assigned);
         Ok(())
     }
 

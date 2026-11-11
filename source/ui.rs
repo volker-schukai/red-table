@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
@@ -36,6 +38,59 @@ pub(crate) struct RenderOptions<'a> {
     pub(crate) show_help: bool,
     pub(crate) debug_status: bool,
     pub(crate) selection_mode: bool,
+}
+
+const FILMSTRIP_CELL_WIDTH: u16 = 14;
+const FILMSTRIP_CELL_HEIGHT: u16 = 7;
+/// Rows the inspected image keeps at least before the filmstrip is dropped.
+const FILMSTRIP_MIN_IMAGE_ROWS: u16 = 10;
+
+/// One row of fixed-size thumbnail cells below the inspected image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FilmstripLayout {
+    pub(crate) area: Rect,
+    pub(crate) columns: usize,
+    pub(crate) image_size: Size,
+}
+
+impl FilmstripLayout {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(area: Rect) -> Self {
+        Self::new(area)
+    }
+
+    fn new(area: Rect) -> Self {
+        Self {
+            area,
+            columns: (area.width / FILMSTRIP_CELL_WIDTH) as usize,
+            image_size: Size::new(FILMSTRIP_CELL_WIDTH - 2, FILMSTRIP_CELL_HEIGHT - 2),
+        }
+    }
+
+    /// Filtered positions shown in the strip: centred on `selected` and
+    /// clamped so both ends of the ordering fill the strip.
+    pub(crate) fn window(self, selected: usize, len: usize) -> Range<usize> {
+        let count = self.columns.min(len);
+        let start = selected.saturating_sub(count / 2).min(len - count);
+        start..start + count
+    }
+
+    fn cell(self, index: usize, count: usize) -> Rect {
+        let used = count as u16 * FILMSTRIP_CELL_WIDTH;
+        Rect::new(
+            self.area.x + (self.area.width - used) / 2 + index as u16 * FILMSTRIP_CELL_WIDTH,
+            self.area.y,
+            FILMSTRIP_CELL_WIDTH,
+            FILMSTRIP_CELL_HEIGHT,
+        )
+    }
+}
+
+/// Inspection areas whose sizes drive background scheduling.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InspectionLayout {
+    pub(crate) image_size: Size,
+    pub(crate) filmstrip: Option<FilmstripLayout>,
 }
 
 impl GridLayout {
@@ -412,21 +467,37 @@ pub(crate) struct InspectionOptions<'a> {
     pub(crate) debug_status: bool,
     pub(crate) protocol_name: &'a str,
     pub(crate) selection_mode: bool,
+    pub(crate) filmstrip: bool,
+    pub(crate) thumbnail_quality: ThumbnailQuality,
+}
+
+fn filmstrip_height(enabled: bool, area: Rect) -> u16 {
+    let fits = area.width >= FILMSTRIP_CELL_WIDTH
+        && area.height >= 4 + FILMSTRIP_CELL_HEIGHT + FILMSTRIP_MIN_IMAGE_ROWS;
+    if enabled && fits {
+        FILMSTRIP_CELL_HEIGHT
+    } else {
+        0
+    }
 }
 
 pub(crate) fn render_inspection(
     frame: &mut Frame<'_>,
     app: &App,
+    thumbnails: &mut Thumbnails,
     options: InspectionOptions<'_>,
-) -> Size {
+) -> InspectionLayout {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(1),
+            Constraint::Length(filmstrip_height(options.filmstrip, frame.area())),
             Constraint::Length(2),
         ])
         .split(frame.area());
+    let filmstrip = (areas[2].height > 0).then(|| FilmstripLayout::new(areas[2]));
+    render_filmstrip(frame, app, thumbnails, filmstrip, options.thumbnail_quality);
     let selected = if app.filtered.is_empty() {
         0
     } else {
@@ -520,12 +591,65 @@ pub(crate) fn render_inspection(
             Line::from(path.into_owned()),
             Line::from(Span::styled(help, Style::default().fg(Color::DarkGray))),
         ]),
-        areas[2],
+        areas[3],
     );
     if options.show_help {
         render_help(frame, options.bindings, ActionContext::Inspect);
     }
-    Size::new(areas[1].width, areas[1].height)
+    InspectionLayout {
+        image_size: Size::new(areas[1].width, areas[1].height),
+        filmstrip,
+    }
+}
+
+/// Publishes the strip's visible thumbnail keys (empty when hidden) so Kitty
+/// images re-arm only when they newly appear, then draws the strip cells.
+fn render_filmstrip(
+    frame: &mut Frame<'_>,
+    app: &App,
+    thumbnails: &mut Thumbnails,
+    filmstrip: Option<FilmstripLayout>,
+    thumbnail_quality: ThumbnailQuality,
+) {
+    let Some(filmstrip) = filmstrip else {
+        thumbnails.update_visible([]);
+        return;
+    };
+    let window = filmstrip.window(app.selected, app.filtered.len());
+    let count = window.len();
+    let entries = app.filtered[window.clone()]
+        .iter()
+        .filter_map(|id| app.entry(*id))
+        .collect::<Vec<_>>();
+    let key = |entry: &crate::app::ImageEntry| ThumbnailKey {
+        entry_id: entry.id,
+        revision: entry.revision,
+        size: filmstrip.image_size,
+        quality: thumbnail_quality,
+    };
+    thumbnails.update_visible(entries.iter().map(|entry| key(entry)));
+
+    for (index, (position, entry)) in window.zip(&entries).enumerate() {
+        let block = grid_card_block(position == app.selected, app.is_marked(entry.id));
+        let outer = filmstrip.cell(index, count);
+        let inner = block.inner(outer);
+        frame.render_widget(block, outer);
+        match thumbnails.display(key(entry)) {
+            ThumbnailDisplay::Ready(thumbnail) => render_prepared(frame, thumbnail, inner),
+            ThumbnailDisplay::Loading => frame.render_widget(
+                Paragraph::new("…")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray)),
+                inner,
+            ),
+            ThumbnailDisplay::Error(_) => frame.render_widget(
+                Paragraph::new("!")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::Red)),
+                inner,
+            ),
+        }
+    }
 }
 
 pub(crate) struct ComparisonOptions<'a> {
@@ -751,6 +875,39 @@ mod tests {
         assert!(larger.columns < default.columns);
         assert!(larger.image_size.width > default.image_size.width);
         assert!(larger.image_size.height >= default.image_size.height);
+    }
+
+    #[test]
+    fn filmstrip_window_centres_on_the_selection_and_clamps_at_the_ends() {
+        let strip = FilmstripLayout::new(Rect::new(0, 0, 5 * FILMSTRIP_CELL_WIDTH + 3, 7));
+        assert_eq!(strip.columns, 5);
+        assert_eq!(strip.window(0, 0), 0..0);
+        assert_eq!(strip.window(1, 3), 0..3);
+        assert_eq!(strip.window(0, 100), 0..5);
+        assert_eq!(strip.window(50, 100), 48..53);
+        assert_eq!(strip.window(99, 100), 95..100);
+        assert_eq!(strip.window(97, 100), 95..100);
+    }
+
+    #[test]
+    fn filmstrip_cells_are_centred_and_stay_inside_the_strip() {
+        let area = Rect::new(2, 30, 80, FILMSTRIP_CELL_HEIGHT);
+        let strip = FilmstripLayout::new(area);
+        let first = strip.cell(0, 3);
+        let last = strip.cell(2, 3);
+        assert_eq!(first.x - area.x, area.right() - last.right());
+        assert!(strip.cell(strip.columns - 1, strip.columns).right() <= area.right());
+    }
+
+    #[test]
+    fn filmstrip_needs_room_for_the_main_image() {
+        assert_eq!(
+            filmstrip_height(true, Rect::new(0, 0, 80, 21)),
+            FILMSTRIP_CELL_HEIGHT
+        );
+        assert_eq!(filmstrip_height(true, Rect::new(0, 0, 80, 20)), 0);
+        assert_eq!(filmstrip_height(true, Rect::new(0, 0, 13, 40)), 0);
+        assert_eq!(filmstrip_height(false, Rect::new(0, 0, 80, 40)), 0);
     }
 
     #[test]

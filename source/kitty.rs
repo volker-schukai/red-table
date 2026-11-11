@@ -5,7 +5,7 @@ use std::{
     fmt::Write,
     io::{self, Write as IoWrite},
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
@@ -29,7 +29,10 @@ const MAX_TRACKED_IMAGE_IDS: usize = 512;
 /// RGBA payloads at or above this size are zlib-compressed (`o=z`) before
 /// Base64 encoding.
 const COMPRESSION_THRESHOLD_BYTES: usize = 1024 * 1024;
-static NEXT_IMAGE_ID: AtomicU32 = AtomicU32::new(1);
+/// Starts at a per-process random offset so instances sharing one terminal
+/// image store, for example tmux panes, do not reuse each other's IDs.
+static NEXT_IMAGE_ID: LazyLock<AtomicU32> =
+    LazyLock::new(|| AtomicU32::new(random_image_id_origin()));
 
 #[derive(Clone)]
 pub(crate) struct KittySession {
@@ -328,6 +331,13 @@ fn is_tmux_environment(
         || program.is_some_and(|value| value == "tmux")
 }
 
+fn random_image_id_origin() -> u32 {
+    use std::hash::BuildHasher;
+
+    let seed = std::collections::hash_map::RandomState::new().hash_one(std::process::id());
+    (seed % u64::from(MAX_IMAGE_ID)) as u32 + 1
+}
+
 fn next_image_id() -> u32 {
     NEXT_IMAGE_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -341,9 +351,14 @@ fn next_image_id() -> u32 {
 }
 
 fn transmit_virtual(image: DynamicImage, size: Size, id: u32, is_tmux: bool) -> String {
-    let rgba = image.into_rgba8();
-    let (pixel_width, pixel_height) = rgba.dimensions();
-    let (bytes, compressed) = compress_payload(rgba.into_raw());
+    let (pixel_width, pixel_height) = (image.width(), image.height());
+    // Opaque sources skip the constant alpha byte.
+    let (format, raw) = if image.color().has_alpha() {
+        (32, image.into_rgba8().into_raw())
+    } else {
+        (24, image.into_rgb8().into_raw())
+    };
+    let (bytes, compressed) = compress_payload(raw);
     let chunks = bytes.chunks(BYTES_PER_CHUNK);
     let chunk_count = chunks.len();
     let (start, escape, end) = Parser::tmux_start_escape_end(is_tmux);
@@ -358,7 +373,7 @@ fn transmit_virtual(image: DynamicImage, size: Size, id: u32, is_tmux: bool) -> 
         if index == 0 {
             write!(
                 output,
-                "i={id},a=T,U=1,N=1,c={},r={},f=32,t=d,s={pixel_width},v={pixel_height},",
+                "i={id},a=T,U=1,N=1,c={},r={},f={format},t=d,s={pixel_width},v={pixel_height},",
                 size.width, size.height,
             )
             .expect("writing to a String cannot fail");
@@ -709,12 +724,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_id_origins_are_random_per_process_and_in_range() {
+        let origins = (0..8).map(|_| random_image_id_origin()).collect::<Vec<_>>();
+        assert!(origins.iter().all(|id| (1..=MAX_IMAGE_ID).contains(id)));
+        assert!(
+            origins.windows(2).any(|pair| pair[0] != pair[1]),
+            "origins must not be a fixed value: {origins:?}"
+        );
+    }
+
+    #[test]
     fn transmission_declares_virtual_placement_extent_and_exact_rgba_payload() {
         let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 255])));
         let command = transmit_virtual(image, Size::new(32, 14), 42, false);
 
         assert!(command.starts_with("\x1b_Gq=2,i=42,a=T,U=1,N=1,c=32,r=14,f=32,t=d,s=1,v=1,m=0;"));
         assert!(command.ends_with("/wAA/w==\x1b\\"));
+    }
+
+    #[test]
+    fn opaque_images_transmit_rgb_and_alpha_images_keep_rgba() {
+        use image::{Rgb, RgbImage};
+
+        let rgb = RgbImage::from_fn(64, 32, |x, y| Rgb([x as u8, y as u8, 9]));
+        let (header, payload) = decode_transmission(&transmit_virtual(
+            DynamicImage::ImageRgb8(rgb.clone()),
+            Size::new(8, 4),
+            3,
+            false,
+        ));
+        assert!(header.contains(",f=24,"), "{header}");
+        assert_eq!(payload, rgb.as_raw().as_slice());
+
+        let rgba = DynamicImage::ImageRgb8(rgb).into_rgba8();
+        let (header, rgba_payload) = decode_transmission(&transmit_virtual(
+            DynamicImage::ImageRgba8(rgba),
+            Size::new(8, 4),
+            4,
+            false,
+        ));
+        assert!(header.contains(",f=32,"), "{header}");
+        assert_eq!(payload.len() * 4, rgba_payload.len() * 3, "RGB saves 25%");
     }
 
     /// Splits a direct (non-tmux) transmission into its chunk payloads and

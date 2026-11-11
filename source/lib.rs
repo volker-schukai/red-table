@@ -17,6 +17,7 @@ mod shell;
 mod terminal;
 mod thumbnails;
 mod ui;
+mod worker;
 
 use std::{error::Error, ffi::OsString, io};
 
@@ -125,7 +126,13 @@ where
                 browser::BrowseOutcome::Completed => Ok(RunOutcome::Completed),
                 browser::BrowseOutcome::Cancelled => Ok(RunOutcome::Cancelled),
                 browser::BrowseOutcome::Selection(paths) => {
-                    path_io::write_paths(&mut io::stdout().lock(), &paths, options.print0)?;
+                    let terminal = io::IsTerminal::is_terminal(&io::stdout());
+                    path_io::write_selection(
+                        &mut io::stdout().lock(),
+                        &paths,
+                        options.print0,
+                        terminal,
+                    )?;
                     Ok(RunOutcome::Completed)
                 }
             }

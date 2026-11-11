@@ -98,18 +98,21 @@ Run `task` to list every development command.
 - `F12`: toggle renderer, quality, queue, and cache diagnostics
 - `q`: quit; Escape only closes or cancels the active nested view
 
-In fullscreen inspection, `p` / `n` select the previous / next match, `z`
-switches between fit and exact 100%, and `+` / `-` select the bounded 25–800%
-zoom levels. Arrows or `h`, `j`, `k`, `l` pan the crop; `b` cycles the
-checkerboard, dark, and light transparency backgrounds. Decoding and crop
+In fullscreen inspection, `p` / `n` or PageUp / PageDown select the previous /
+next match, `z` switches between fit and exact 100%, and `+` / `-` select the
+bounded 25–800% zoom levels. At fit, Left / Right also select the previous /
+next image; when zoomed, arrows or `h`, `j`, `k`, `l` pan the crop; `b` cycles
+the checkerboard, dark, and light transparency backgrounds. Decoding and crop
 preparation remain off the input thread, and EXIF orientation is applied before
-display.
+display. A filmstrip of neighbouring images runs below the image; `t` hides or
+shows it.
 
-In A/B comparison, the left `REFERENCE` stays pinned while `p` / `n` changes the
-right `CANDIDATE`. Enter promotes the candidate and continues with another image.
-Tab chooses the active pane; Space marks that pane's image. `s` switches between
-coupled and independent zoom/pan. When coupled, normalized centers and zoom levels
-stay identical even for different source dimensions. Escape returns to the grid.
+In A/B comparison, the left `REFERENCE` stays pinned while `p` / `n` or PageUp /
+PageDown change the right `CANDIDATE`. Enter promotes the candidate and
+continues with another image. Tab chooses the active pane; Space marks that
+pane's image. `s` switches between coupled and independent zoom/pan. When
+coupled, normalized centers and zoom levels stay identical even for different
+source dimensions. Escape returns to the grid.
 
 Use red-table as a visual shell filter with:
 
@@ -120,9 +123,11 @@ nix run . -- --select --print0 /path/to/photos > selection.paths0
 The interface is written only to `/dev/tty`; confirmed full paths are the only
 bytes written to stdout. NUL mode preserves arbitrary Unix filename bytes and is
 safe for tools such as `xargs -0`. Without `--print0`, one full path is emitted
-per line for human-readable workflows. `q` cancels with status 2 and no output;
-Ctrl+s confirms, including a successful empty selection. A producer
-can provide an ordered NUL-delimited file list instead of a directory:
+per line for human-readable workflows; on a terminal, control characters are
+shown escaped, and a path containing a newline is refused unless `--print0` is
+used. `q` cancels with status 2 and no output; Ctrl+s confirms, including a
+successful empty selection. A producer can provide an ordered NUL-delimited file
+list instead of a directory:
 
 ```sh
 find ./photos -type f -print0 |

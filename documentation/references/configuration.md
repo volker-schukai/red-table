@@ -29,6 +29,7 @@ debug_status = false
 [inspection]
 background = "checkerboard" # checkerboard, dark, or light
 decoded_cache_mib = 512      # 64 through 2048
+filmstrip = true             # thumbnail strip below the inspected image
 
 [keys.normal]
 toggle_sort = ["s"]
@@ -72,16 +73,19 @@ backspace = ["Backspace"]
 [keys.inspect]
 quit = ["q"]
 close = ["Esc"]
-previous = ["p"]
-next = ["n"]
+previous = ["p", "PageUp"]
+next = ["n", "PageDown"]
 fit_100 = ["z"]
 zoom_in = ["+"]
 zoom_out = ["-"]
-pan_left = ["Left", "h"]
-pan_right = ["Right", "l"]
+pan_left = ["h"]
+pan_right = ["l"]
+previous_or_pan_left = ["Left"]  # previous image at fit, pan when zoomed
+next_or_pan_right = ["Right"]    # next image at fit, pan when zoomed
 pan_up = ["Up", "k"]
 pan_down = ["Down", "j"]
 background = ["b"]
+filmstrip = ["t"]
 help = ["?"]
 debug = ["F12"]
 toggle_mark = ["Space"]
@@ -93,8 +97,8 @@ confirm_selection = ["Ctrl+s"]
 [keys.compare]
 quit = ["q"]
 close = ["Esc"]
-previous = ["p"]
-next = ["n"]
+previous = ["p", "PageUp"]
+next = ["n", "PageDown"]
 promote = ["Enter"]
 switch_pane = ["Tab"]
 sync = ["s"]
@@ -115,7 +119,10 @@ confirm_selection = ["Ctrl+s"]
 ```
 
 Sections and values may be omitted. A configured action replaces all of that
-action's built-in keys; actions not mentioned retain their defaults. Reusing a
+action's built-in keys; actions not mentioned retain their defaults. A
+configured key takes precedence over a built-in binding of the same key in that
+context, so two built-in keys can be swapped; the built-in action then loses that
+key. Two configured actions sharing a key in one context are rejected. Reusing a
 key in different contexts is valid.
 
 Key names are case-sensitive. Printable characters can be written directly.
@@ -131,6 +138,8 @@ action reveals renderer, quality, queue, and cache diagnostics.
 The decoded inspection cache is byte-bounded independently from the thumbnail
 cache. Its value is in mebibytes. Transparent images are composited onto the
 configured initial background; `background` cycles the three modes at runtime.
+`filmstrip` sets whether inspection starts with the thumbnail strip; the
+`filmstrip` action toggles it for the session.
 
 Selection actions are available in normal and inspection contexts. The
 `confirm_selection` action ends only a `--select` session; it is inert during a

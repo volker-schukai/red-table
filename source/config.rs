@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::{
     BoxError,
-    actions::{Action, ActionContext, Bindings},
+    actions::{Action, ActionContext, Bindings, KeyChord},
     graphics::GraphicsProtocol,
     settings::{
         BackgroundMode, DEFAULT_THUMBNAIL_QUALITY, DEFAULT_THUMBNAIL_SIZE, ThumbnailQuality,
@@ -36,6 +36,7 @@ pub(crate) struct RuntimeSettings {
     pub(crate) debug_status: bool,
     pub(crate) background: BackgroundMode,
     pub(crate) decoded_cache_bytes: u64,
+    pub(crate) filmstrip: bool,
     pub(crate) bindings: Bindings,
 }
 
@@ -83,6 +84,7 @@ struct KeysDocument {
 struct InspectionDocument {
     background: Option<String>,
     decoded_cache_mib: Option<u64>,
+    filmstrip: Option<bool>,
 }
 
 impl RuntimeSettings {
@@ -95,6 +97,7 @@ impl RuntimeSettings {
             debug_status: false,
             background: BackgroundMode::Checkerboard,
             decoded_cache_bytes: 512 * 1024 * 1024,
+            filmstrip: true,
             bindings: Bindings::built_in(),
         };
         if let Some(document) = document {
@@ -163,6 +166,9 @@ impl RuntimeSettings {
                 }
                 self.decoded_cache_bytes = mebibytes * 1024 * 1024;
             }
+            if let Some(filmstrip) = inspection.filmstrip {
+                self.filmstrip = filmstrip;
+            }
         }
         Ok(())
     }
@@ -172,14 +178,21 @@ impl RuntimeSettings {
         context: ActionContext,
         actions: Option<BTreeMap<String, Vec<String>>>,
     ) -> Result<(), BoxError> {
+        let context_name = context_name(context);
+        let mut configured = Vec::new();
         for (name, keys) in actions.unwrap_or_default() {
             let action = Action::from_name(&name)
-                .map_err(|error| format!("keys.{}: {error}", context_name(context)))?;
-            self.bindings
-                .replace_action(context, action, &keys)
-                .map_err(|error| format!("keys.{}.{name}: {error}", context_name(context)))?;
+                .map_err(|error| format!("keys.{context_name}: {error}"))?;
+            let keys = keys
+                .iter()
+                .map(|key| key.parse::<KeyChord>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("keys.{context_name}.{name}: {error}"))?;
+            configured.push((action, keys));
         }
-        Ok(())
+        self.bindings
+            .configure_context(context, configured)
+            .map_err(|error| format!("keys.{context_name}: {error}").into())
     }
 }
 
@@ -287,6 +300,7 @@ version = 1
 [inspection]
 background = "dark"
 decoded_cache_mib = 256
+filmstrip = false
 [keys.inspect]
 fit_100 = ["f"]
 [keys.compare]
@@ -300,6 +314,7 @@ promote = ["P"]
         .unwrap();
         assert_eq!(settings.background, BackgroundMode::Dark);
         assert_eq!(settings.decoded_cache_bytes, 256 * 1024 * 1024);
+        assert!(!settings.filmstrip);
         assert_eq!(
             settings.bindings.action(
                 ActionContext::Inspect,
@@ -329,7 +344,10 @@ promote = ["P"]
             ("field", "version = 1\nwat = true\n"),
             ("version", "version = 2\n"),
             ("action", "version = 1\n[keys.normal]\nteleport = [\"t\"]\n"),
-            ("conflict", "version = 1\n[keys.normal]\nleft = [\"j\"]\n"),
+            (
+                "conflict",
+                "version = 1\n[keys.normal]\nleft = [\"x\"]\nright = [\"x\"]\n",
+            ),
             (
                 "inspection-memory",
                 "version = 1\n[inspection]\ndecoded_cache_mib = 8\n",
@@ -346,6 +364,55 @@ promote = ["P"]
             );
             fs::remove_file(path).unwrap();
         }
+    }
+
+    #[test]
+    fn user_keys_displace_built_in_bindings_and_allow_swaps() {
+        let path = temporary_file(
+            "precedence",
+            r#"
+version = 1
+[keys.normal]
+search = ["s"]
+toggle_sort = ["/"]
+[keys.inspect]
+pan_left = ["Left", "h"]
+"#,
+        );
+        let settings = RuntimeSettings::load(
+            &ConfigSource::Explicit(path.clone()),
+            &CliOverrides::default(),
+        )
+        .unwrap();
+        let press = |context, code| {
+            settings.bindings.action(
+                context,
+                crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            )
+        };
+        use crossterm::event::KeyCode;
+        assert_eq!(
+            press(ActionContext::Normal, KeyCode::Char('s')),
+            Some(Action::StartSearch)
+        );
+        assert_eq!(
+            press(ActionContext::Normal, KeyCode::Char('/')),
+            Some(Action::ToggleSort)
+        );
+        assert_eq!(
+            press(ActionContext::Inspect, KeyCode::Left),
+            Some(Action::PanLeft)
+        );
+        assert_eq!(
+            press(ActionContext::Inspect, KeyCode::Right),
+            Some(Action::NextOrPanRight)
+        );
+        assert_eq!(
+            press(ActionContext::Normal, KeyCode::Left),
+            Some(Action::MoveLeft),
+            "other contexts keep their defaults"
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

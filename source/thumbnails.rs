@@ -511,19 +511,24 @@ fn worker(
             return;
         };
 
-        let protocol = if request.generation == current_generation.load(Ordering::Acquire) {
-            let result = prepare(
-                &picker,
-                &persistent_cache,
-                &request.path,
-                request.key.size,
-                request.key.quality,
-                &kitty_session,
-            );
-            (request.generation == current_generation.load(Ordering::Acquire)).then_some(result)
-        } else {
-            None
-        };
+        // Stale requests are skipped before work starts; finished work is always
+        // delivered because a small viewport or filmstrip shift usually keeps the
+        // entry visible.
+        let protocol =
+            (request.generation == current_generation.load(Ordering::Acquire)).then(|| {
+                crate::worker::catch_panic(|| {
+                    crate::image_source::with_decode_scope(|| {
+                        prepare(
+                            &picker,
+                            &persistent_cache,
+                            &request.path,
+                            request.key.size,
+                            request.key.quality,
+                            &kitty_session,
+                        )
+                    })
+                })
+            });
 
         if sender
             .send(Response {
@@ -708,18 +713,45 @@ fn resize_for_protocol(
         ));
     }
     let mut image = if halfblocks {
-        image.resize_exact(
+        crate::image_source::resize_exact(
+            &image,
             u32::from(encoded_size.width),
             u32::from(encoded_size.height) * 2,
             profile.filter,
         )
     } else {
-        resize.resize(&image, picker.font_size(), encoded_size, None)
+        fit_into_cells(
+            &image,
+            sample_width as u32,
+            sample_height as u32,
+            profile.filter,
+        )
     };
     if let Some((sigma, threshold)) = profile.unsharpen {
         image = image.unsharpen(sigma, threshold);
     }
     Ok((image, encoded_size))
+}
+
+/// Fits `image` into a `width` x `height` sample box and pads the remainder
+/// with transparency, like `ratatui_image::Resize::Fit`, but with the shared
+/// SIMD resize.
+fn fit_into_cells(
+    image: &DynamicImage,
+    width: u32,
+    height: u32,
+    filter: FilterType,
+) -> DynamicImage {
+    let (fitted_width, fitted_height) =
+        crate::image_source::fit_dimensions(image.width(), image.height(), width, height);
+    let fitted = crate::image_source::resize_exact(image, fitted_width, fitted_height, filter);
+    if (fitted_width, fitted_height) == (width, height) {
+        return fitted;
+    }
+    let mut padded: DynamicImage =
+        image::RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 0])).into();
+    image::imageops::overlay(&mut padded, &fitted, 0, 0);
+    padded
 }
 
 #[cfg(test)]

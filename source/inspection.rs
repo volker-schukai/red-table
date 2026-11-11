@@ -9,7 +9,7 @@ use std::{
     thread,
 };
 
-use image::{DynamicImage, Rgba, RgbaImage, imageops::FilterType};
+use image::{DynamicImage, Pixel, Rgb, RgbImage, RgbaImage, imageops::FilterType};
 use ratatui::layout::Size;
 use ratatui_image::{
     FontSize,
@@ -386,35 +386,41 @@ fn worker(
         let prepared = if !current {
             None
         } else {
-            let cached = {
-                decoded_sources
-                    .cache
-                    .lock()
-                    .expect("decoded cache mutex should not be poisoned")
-                    .get(request.key.entry_id, request.key.revision)
-            };
-            let source = cached.map(Ok).unwrap_or_else(|| {
-                decode_oriented(&request.path).map(|image| {
-                    let image = Arc::new(image);
-                    decoded_sources
-                        .cache
-                        .lock()
-                        .expect("decoded cache mutex should not be poisoned")
-                        .insert(
-                            request.key.entry_id,
-                            request.key.revision,
-                            Arc::clone(&image),
-                        );
-                    image
+            crate::worker::catch_panic(|| {
+                crate::image_source::with_decode_scope(|| {
+                    let cached = {
+                        decoded_sources
+                            .cache
+                            .lock()
+                            .expect("decoded cache mutex should not be poisoned")
+                            .get(request.key.entry_id, request.key.revision)
+                    };
+                    let source = cached.map(Ok).unwrap_or_else(|| {
+                        decode_oriented(&request.path).map(|image| {
+                            let image = Arc::new(image);
+                            decoded_sources
+                                .cache
+                                .lock()
+                                .expect("decoded cache mutex should not be poisoned")
+                                .insert(
+                                    request.key.entry_id,
+                                    request.key.revision,
+                                    Arc::clone(&image),
+                                );
+                            image
+                        })
+                    });
+                    if request.generation != generation.load(Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    source
+                        .and_then(|source| {
+                            prepare_view_with_session(&picker, &source, request.key, &kitty_session)
+                        })
+                        .map(Some)
                 })
-            });
-            if request.generation != generation.load(Ordering::Acquire) {
-                None
-            } else {
-                Some(source.and_then(|source| {
-                    prepare_view_with_session(&picker, &source, request.key, &kitty_session)
-                }))
-            }
+            })
+            .transpose()
         };
         let prepared = (request.generation == generation.load(Ordering::Acquire))
             .then_some(prepared)
@@ -520,7 +526,6 @@ fn prepare_view_with_session(
     if prepared_bytes > MAX_PREPARED_VIEW_BYTES {
         return Err("terminal view exceeds the 128 MiB prepared-image limit".into());
     }
-    let mut canvas = background(target_width, target_height, key.background);
     let rendered = match key.zoom {
         Zoom::Fit => crate::image_source::downscale(
             source,
@@ -538,24 +543,48 @@ fn prepare_view_with_session(
                 key.center_x,
                 key.center_y,
             );
-            source
-                .crop_imm(geometry.x, geometry.y, geometry.width, geometry.height)
-                .resize_exact(
-                    geometry.display_width,
-                    geometry.display_height,
-                    FilterType::Lanczos3,
-                )
+            crate::image_source::resize_crop_exact(
+                source,
+                (geometry.x, geometry.y, geometry.width, geometry.height),
+                geometry.display_width,
+                geometry.display_height,
+                FilterType::Lanczos3,
+            )
         }
     };
-    let x = i64::from(target_width.saturating_sub(rendered.width()) / 2);
-    let y = i64::from(target_height.saturating_sub(rendered.height()) / 2);
-    image::imageops::overlay(&mut canvas, &rendered.into_rgba8(), x, y);
     encode_exact(
         picker,
-        DynamicImage::ImageRgba8(canvas),
+        DynamicImage::ImageRgb8(composite(
+            rendered,
+            target_width,
+            target_height,
+            key.background,
+        )),
         key.size,
         kitty_session,
     )
+}
+
+/// Centres `rendered` on the opaque background. The result is always opaque,
+/// so it is RGB and Kitty can skip the alpha byte. Opaque sources are copied
+/// instead of blended, and one that fills the view needs no background at all.
+fn composite(rendered: DynamicImage, width: u32, height: u32, mode: BackgroundMode) -> RgbImage {
+    let x = i64::from(width.saturating_sub(rendered.width()) / 2);
+    let y = i64::from(height.saturating_sub(rendered.height()) / 2);
+    if rendered.color().has_alpha() {
+        let mut canvas = RgbaImage::from_fn(width, height, |x, y| {
+            Rgb([background(x, y, mode); 3]).to_rgba()
+        });
+        image::imageops::overlay(&mut canvas, &rendered.into_rgba8(), x, y);
+        return DynamicImage::ImageRgba8(canvas).into_rgb8();
+    }
+    let rendered = rendered.into_rgb8();
+    if rendered.dimensions() == (width, height) {
+        return rendered;
+    }
+    let mut canvas = RgbImage::from_fn(width, height, |x, y| Rgb([background(x, y, mode); 3]));
+    image::imageops::replace(&mut canvas, &rendered, x, y);
+    canvas
 }
 
 fn sample_size(picker: &Picker) -> FontSize {
@@ -566,16 +595,14 @@ fn sample_size(picker: &Picker) -> FontSize {
     }
 }
 
-fn background(width: u32, height: u32, mode: BackgroundMode) -> RgbaImage {
-    RgbaImage::from_fn(width, height, |x, y| {
-        let value = match mode {
-            BackgroundMode::Checkerboard if (x / 8 + y / 8).is_multiple_of(2) => 72,
-            BackgroundMode::Checkerboard => 112,
-            BackgroundMode::Dark => 24,
-            BackgroundMode::Light => 224,
-        };
-        Rgba([value, value, value, 255])
-    })
+/// Gray level of the transparency background at one sample.
+fn background(x: u32, y: u32, mode: BackgroundMode) -> u8 {
+    match mode {
+        BackgroundMode::Checkerboard if (x / 8 + y / 8).is_multiple_of(2) => 72,
+        BackgroundMode::Checkerboard => 112,
+        BackgroundMode::Dark => 24,
+        BackgroundMode::Light => 224,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -737,6 +764,53 @@ mod tests {
         };
         let prepared = prepare_view(&Picker::halfblocks(), &source, key).unwrap();
         assert_eq!(prepared.size(), Size::new(2, 1));
+    }
+
+    /// The blend-everything composite used before the opaque fast path.
+    fn reference_composite(
+        rendered: &DynamicImage,
+        width: u32,
+        height: u32,
+        mode: BackgroundMode,
+    ) -> RgbImage {
+        let mut canvas = RgbaImage::from_fn(width, height, |x, y| {
+            let value = background(x, y, mode);
+            image::Rgba([value, value, value, 255])
+        });
+        let x = i64::from(width.saturating_sub(rendered.width()) / 2);
+        let y = i64::from(height.saturating_sub(rendered.height()) / 2);
+        image::imageops::overlay(&mut canvas, &rendered.to_rgba8(), x, y);
+        DynamicImage::ImageRgba8(canvas).into_rgb8()
+    }
+
+    #[test]
+    fn opaque_and_alpha_composites_match_blending_onto_the_background() {
+        let opaque = DynamicImage::ImageRgb8(RgbImage::from_fn(40, 20, |x, y| {
+            Rgb([x as u8 * 5, y as u8 * 9, 77])
+        }));
+        let gray = DynamicImage::ImageLuma8(opaque.to_luma8());
+        let translucent = DynamicImage::ImageRgba8(RgbaImage::from_fn(40, 20, |x, y| {
+            image::Rgba([200, x as u8 * 5, y as u8 * 9, (x * 6) as u8])
+        }));
+        for mode in [
+            BackgroundMode::Checkerboard,
+            BackgroundMode::Dark,
+            BackgroundMode::Light,
+        ] {
+            for rendered in [&opaque, &gray, &translucent] {
+                // Letterboxed, exact fit, and larger than the view.
+                for (width, height) in [(64, 48), (40, 20), (30, 10)] {
+                    assert_eq!(
+                        composite(rendered.clone(), width, height, mode).as_raw(),
+                        reference_composite(rendered, width, height, mode).as_raw(),
+                        "{:?} on {mode:?} in {width}x{height}",
+                        rendered.color()
+                    );
+                }
+            }
+        }
+        let background_only = composite(translucent, 64, 48, BackgroundMode::Light);
+        assert_eq!(background_only.get_pixel(0, 0), &Rgb([224, 224, 224]));
     }
 
     #[test]

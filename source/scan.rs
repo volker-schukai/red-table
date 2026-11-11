@@ -1,21 +1,123 @@
-use std::{collections::HashSet, path::PathBuf, sync::mpsc, thread, time::UNIX_EPOCH};
+#[cfg(test)]
+use std::time::SystemTime;
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant, UNIX_EPOCH},
+};
 
 use ignore::{WalkBuilder, WalkState};
 
 use crate::app::{SourceRevision, is_supported_image};
 
+/// Found images per scan event; with [`CHANNEL_BATCHES`] this bounds the paths
+/// buffered between the scanner and the interface.
+const BATCH_ENTRIES: usize = 256;
+const CHANNEL_BATCHES: usize = 64;
+/// A partial batch older than this is sent so slow walks stay incremental.
+const BATCH_MAX_AGE: Duration = Duration::from_millis(50);
+
 #[derive(Debug)]
 pub(crate) enum ScanEvent {
-    Found {
-        path: PathBuf,
-        revision: SourceRevision,
-    },
+    Found(Vec<(PathBuf, SourceRevision)>),
     Error,
     Done,
 }
 
+/// What one bounded [`drain`] took from the scanner.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct Drained {
+    pub(crate) found: usize,
+    pub(crate) errors: usize,
+    pub(crate) done: bool,
+}
+
+/// Takes scan events until the channel is empty, the scan ends, or `budget`
+/// has elapsed, so a fast scan cannot stall a frame. At least one available
+/// event is always taken.
+pub(crate) fn drain(
+    receiver: &mpsc::Receiver<ScanEvent>,
+    budget: Duration,
+    mut found: impl FnMut(PathBuf, SourceRevision),
+) -> Drained {
+    let started = Instant::now();
+    let mut drained = Drained::default();
+    loop {
+        match receiver.try_recv() {
+            Ok(ScanEvent::Found(batch)) => {
+                drained.found += batch.len();
+                for (path, revision) in batch {
+                    found(path, revision);
+                }
+            }
+            Ok(ScanEvent::Error) => drained.errors += 1,
+            Ok(ScanEvent::Done) | Err(mpsc::TryRecvError::Disconnected) => {
+                drained.done = true;
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => break,
+        }
+        if started.elapsed() >= budget {
+            break;
+        }
+    }
+    drained
+}
+
+/// Collects found images of one scanner thread into bounded batches. Dropping
+/// it sends the remainder, so every path precedes the scan's `Done`.
+struct Batcher {
+    sender: mpsc::SyncSender<ScanEvent>,
+    found: Vec<(PathBuf, SourceRevision)>,
+    oldest: Instant,
+}
+
+impl Batcher {
+    fn new(sender: mpsc::SyncSender<ScanEvent>) -> Self {
+        Self {
+            sender,
+            found: Vec::new(),
+            oldest: Instant::now(),
+        }
+    }
+
+    /// Returns `false` once the receiver is gone.
+    fn push(&mut self, path: PathBuf, revision: SourceRevision) -> bool {
+        if self.found.is_empty() {
+            self.oldest = Instant::now();
+        }
+        self.found.push((path, revision));
+        self.found.len() < BATCH_ENTRIES || self.flush()
+    }
+
+    fn error(&mut self) -> bool {
+        self.sender.send(ScanEvent::Error).is_ok()
+    }
+
+    /// Sends a partial batch that has waited long enough.
+    fn flush_if_due(&mut self) -> bool {
+        self.found.is_empty() || self.oldest.elapsed() < BATCH_MAX_AGE || self.flush()
+    }
+
+    fn flush(&mut self) -> bool {
+        self.found.is_empty()
+            || self
+                .sender
+                .send(ScanEvent::Found(std::mem::take(&mut self.found)))
+                .is_ok()
+    }
+}
+
+impl Drop for Batcher {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 pub(crate) fn start(root: PathBuf) -> mpsc::Receiver<ScanEvent> {
-    let (sender, receiver) = mpsc::sync_channel(1024);
+    let (sender, receiver) = mpsc::sync_channel(CHANNEL_BATCHES);
 
     thread::Builder::new()
         .name("red-table-scanner".into())
@@ -29,28 +131,28 @@ pub(crate) fn start(root: PathBuf) -> mpsc::Receiver<ScanEvent> {
                 .build_parallel();
 
             walker.run(|| {
-                let sender = sender.clone();
+                let mut batcher = Batcher::new(sender.clone());
                 Box::new(move |result| {
-                    let event = match result {
+                    let connected = match result {
                         Ok(entry) if entry.file_type().is_some_and(|kind| kind.is_file()) => {
                             let path = entry.into_path();
                             if !is_supported_image(&path) {
-                                None
+                                true
                             } else {
                                 match revision_for(&path) {
-                                    Ok(revision) => Some(ScanEvent::Found { path, revision }),
-                                    Err(()) => Some(ScanEvent::Error),
+                                    Ok(revision) => batcher.push(path, revision),
+                                    Err(()) => batcher.error(),
                                 }
                             }
                         }
-                        Ok(_) => None,
-                        Err(_) => Some(ScanEvent::Error),
+                        Ok(_) => true,
+                        Err(_) => batcher.error(),
                     };
 
-                    if event.is_some_and(|event| sender.send(event).is_err()) {
-                        WalkState::Quit
-                    } else {
+                    if connected && batcher.flush_if_due() {
                         WalkState::Continue
+                    } else {
+                        WalkState::Quit
                     }
                 })
             });
@@ -63,30 +165,32 @@ pub(crate) fn start(root: PathBuf) -> mpsc::Receiver<ScanEvent> {
 }
 
 pub(crate) fn start_paths(root: PathBuf, paths: Vec<PathBuf>) -> mpsc::Receiver<ScanEvent> {
-    let (sender, receiver) = mpsc::sync_channel(1024);
+    let (sender, receiver) = mpsc::sync_channel(CHANNEL_BATCHES);
     thread::Builder::new()
         .name("red-table-file-list".into())
         .spawn(move || {
             let mut seen = HashSet::new();
+            let mut batcher = Batcher::new(sender.clone());
             for path in paths {
                 let path = if path.is_absolute() {
                     path
                 } else {
                     root.join(path)
                 };
-                let event = match path.canonicalize() {
+                let connected = match path.canonicalize() {
                     Ok(path) if !seen.insert(path.clone()) => continue,
-                    Ok(path) if !is_supported_image(&path) => ScanEvent::Error,
+                    Ok(path) if !is_supported_image(&path) => batcher.error(),
                     Ok(path) => match revision_for(&path) {
-                        Ok(revision) => ScanEvent::Found { path, revision },
-                        Err(()) => ScanEvent::Error,
+                        Ok(revision) => batcher.push(path, revision),
+                        Err(()) => batcher.error(),
                     },
-                    Err(_) => ScanEvent::Error,
+                    Err(_) => batcher.error(),
                 };
-                if sender.send(event).is_err() {
+                if !(connected && batcher.flush_if_due()) {
                     return;
                 }
             }
+            drop(batcher);
             let _ = sender.send(ScanEvent::Done);
         })
         .expect("file-list scanner thread should start");
@@ -108,9 +212,126 @@ pub(crate) fn revision_for(path: &std::path::Path) -> Result<SourceRevision, ()>
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::fs;
 
     use super::*;
+
+    fn image(index: usize) -> (PathBuf, SourceRevision) {
+        (
+            format!("/photos/{index}.png").into(),
+            SourceRevision::default(),
+        )
+    }
+
+    #[test]
+    fn batches_flush_on_size_age_and_drop_and_stop_without_a_receiver() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut batcher = Batcher::new(sender);
+        for index in 0..BATCH_ENTRIES - 1 {
+            let (path, revision) = image(index);
+            assert!(batcher.push(path, revision));
+        }
+        assert!(receiver.try_recv().is_err(), "a partial batch waits");
+        let (path, revision) = image(BATCH_ENTRIES);
+        assert!(batcher.push(path, revision));
+        let Ok(ScanEvent::Found(full)) = receiver.try_recv() else {
+            panic!("a full batch is sent at once");
+        };
+        assert_eq!(full.len(), BATCH_ENTRIES);
+
+        let (path, revision) = image(0);
+        assert!(batcher.push(path, revision));
+        assert!(batcher.flush_if_due());
+        assert!(receiver.try_recv().is_err(), "a fresh partial batch waits");
+        batcher.oldest = Instant::now() - BATCH_MAX_AGE;
+        assert!(batcher.flush_if_due());
+        assert!(matches!(receiver.try_recv(), Ok(ScanEvent::Found(batch)) if batch.len() == 1));
+
+        let (path, revision) = image(1);
+        assert!(batcher.push(path, revision));
+        drop(batcher);
+        assert!(
+            matches!(receiver.try_recv(), Ok(ScanEvent::Found(batch)) if batch.len() == 1),
+            "dropping the batcher delivers the remainder"
+        );
+
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut batcher = Batcher::new(sender);
+        drop(receiver);
+        assert!(!batcher.error());
+        let (path, revision) = image(2);
+        batcher.oldest = Instant::now() - BATCH_MAX_AGE;
+        batcher.found.push((path, revision));
+        assert!(!batcher.flush_if_due(), "a closed receiver stops the walk");
+    }
+
+    #[test]
+    fn drain_respects_its_budget_but_always_makes_progress() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        for _ in 0..3 {
+            sender
+                .send(ScanEvent::Found(vec![image(0), image(1)]))
+                .unwrap();
+        }
+        sender.send(ScanEvent::Error).unwrap();
+        let mut paths = Vec::new();
+        let first = drain(&receiver, Duration::ZERO, |path, _| paths.push(path));
+        assert_eq!(
+            first,
+            Drained {
+                found: 2,
+                errors: 0,
+                done: false
+            },
+            "an exhausted budget still takes one event"
+        );
+        let rest = drain(&receiver, Duration::from_secs(60), |path, _| {
+            paths.push(path)
+        });
+        assert_eq!((rest.found, rest.errors, rest.done), (4, 1, false));
+        assert_eq!(paths.len(), 6);
+
+        sender.send(ScanEvent::Done).unwrap();
+        assert!(drain(&receiver, Duration::from_secs(60), |_, _| {}).done);
+        drop(sender);
+        assert!(
+            drain(&receiver, Duration::from_secs(60), |_, _| {}).done,
+            "a vanished scanner ends the scan"
+        );
+    }
+
+    #[test]
+    fn large_scans_deliver_every_path_before_done() {
+        let root = std::env::temp_dir().join(format!(
+            "red-table-scan-large-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let files = BATCH_ENTRIES * 3 + 17;
+        for index in 0..files {
+            let directory = root.join(format!("album-{}", index % 7));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join(format!("{index}.jpg")), b"x").unwrap();
+        }
+        let mut found = HashSet::new();
+        let mut events = start(root.clone()).into_iter();
+        for event in &mut events {
+            match event {
+                ScanEvent::Found(batch) => {
+                    assert!(batch.len() <= BATCH_ENTRIES);
+                    found.extend(batch.into_iter().map(|(path, _)| path));
+                }
+                ScanEvent::Error => panic!("temporary directory should be readable"),
+                ScanEvent::Done => break,
+            }
+        }
+        assert_eq!(found.len(), files);
+        assert!(events.next().is_none(), "nothing follows Done");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn scanner_reports_supported_files_incrementally() {
@@ -129,9 +350,11 @@ mod tests {
         let mut found = Vec::new();
         loop {
             match receiver.recv_timeout(Duration::from_secs(2)).unwrap() {
-                ScanEvent::Found { path, revision } => {
-                    assert!(revision.size > 0);
-                    found.push(path);
+                ScanEvent::Found(batch) => {
+                    for (path, revision) in batch {
+                        assert!(revision.size > 0);
+                        found.push(path);
+                    }
                 }
                 ScanEvent::Error => panic!("temporary directory should be readable"),
                 ScanEvent::Done => break,
@@ -167,8 +390,11 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, ScanEvent::Found { .. }))
-                .count(),
+                .map(|event| match event {
+                    ScanEvent::Found(batch) => batch.len(),
+                    _ => 0,
+                })
+                .sum::<usize>(),
             1
         );
         assert_eq!(

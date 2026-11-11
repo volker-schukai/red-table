@@ -14,14 +14,14 @@ use crate::{
     app::{App, EntryId, InputMode, SourceRevision, is_supported_image},
     config::RuntimeSettings,
     graphics,
-    inspection::{DecodedSources, Inspection, InspectionDisplay, InspectionKey, ViewState},
+    inspection::{DecodedSources, Inspection, InspectionDisplay, InspectionKey, ViewState, Zoom},
     kitty::KittySession,
     refresh::{RevisionCheck, RevisionMonitor},
     scan::{self, ScanEvent},
     settings::{BackgroundMode, DEFAULT_THUMBNAIL_SIZE, ThumbnailQuality, ThumbnailSize},
     terminal::{AppTerminal, TerminalSession, TerminalTarget},
     thumbnails::{ThumbnailKey, Thumbnails},
-    ui::{self, ComparisonOptions, GridLayout, InspectionOptions, RenderOptions},
+    ui::{self, ComparisonOptions, FilmstripLayout, GridLayout, InspectionOptions, RenderOptions},
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -34,7 +34,14 @@ const REPAINT_NUDGE_DELAYS: [Duration; 2] = [Duration::from_millis(50), Duration
 /// pending; this also wakes the loop to schedule source revision checks.
 const IDLE_INTERVAL: Duration = Duration::from_millis(250);
 const REVISION_INTERVAL: Duration = Duration::from_secs(1);
+/// Time one frame spends taking scan results, keeping input responsive while
+/// a fast scan fills a large collection.
+const SCAN_DRAIN_BUDGET: Duration = Duration::from_millis(8);
 const PREFETCH_ROWS: usize = 1;
+/// Further ready input events handled before the next frame.
+const MAX_COALESCED_EVENTS: usize = 64;
+/// Strip cells requested beyond each visible end so paging finds them ready.
+const FILMSTRIP_PREFETCH: usize = 2;
 
 pub(crate) enum BrowseOutcome {
     Completed,
@@ -161,6 +168,8 @@ struct Browser {
     show_help: bool,
     debug_status: bool,
     background: BackgroundMode,
+    filmstrip: bool,
+    filmstrip_layout: Option<FilmstripLayout>,
     running: bool,
     selection_mode: bool,
     confirmed: bool,
@@ -289,6 +298,8 @@ impl Browser {
             show_help: false,
             debug_status: settings.debug_status,
             background: settings.background,
+            filmstrip: settings.filmstrip,
+            filmstrip_layout: None,
             running: true,
             selection_mode,
             confirmed: false,
@@ -315,6 +326,14 @@ impl Browser {
                 .saturating_sub(now.duration_since(frame_started));
             if event::poll(wait)? {
                 dirty |= self.handle_event(event::read()?);
+                // Handle a key-repeat burst before drawing; the cap keeps
+                // rendering responsive under an input flood.
+                for _ in 0..MAX_COALESCED_EVENTS {
+                    if !self.running || !event::poll(Duration::ZERO)? {
+                        break;
+                    }
+                    dirty |= self.handle_event(event::read()?);
+                }
             }
         }
         Ok(())
@@ -381,9 +400,10 @@ impl Browser {
                     .inspection_key
                     .map(|key| self.inspection.display(key))
                     .unwrap_or(InspectionDisplay::Loading);
-                self.inspection_size = ui::render_inspection(
+                let layout = ui::render_inspection(
                     frame,
                     &self.app,
+                    &mut self.thumbnails,
                     InspectionOptions {
                         display,
                         state,
@@ -393,8 +413,12 @@ impl Browser {
                         debug_status: self.debug_status,
                         protocol_name: &self.protocol_name,
                         selection_mode: self.selection_mode,
+                        filmstrip: self.filmstrip,
+                        thumbnail_quality: self.thumbnail_quality,
                     },
                 );
+                self.inspection_size = layout.image_size;
+                self.filmstrip_layout = layout.filmstrip;
             }
             BrowserView::Compare(state) => {
                 let reference_display = self
@@ -452,29 +476,13 @@ impl Browser {
     fn drain_background_work(&mut self) -> bool {
         let mut changed = false;
         if !self.app.scan_done {
-            for _ in 0..2048 {
-                match self.scanner.try_recv() {
-                    Ok(ScanEvent::Found { path, revision }) => {
-                        self.app.add_path(path, revision);
-                        changed = true;
-                    }
-                    Ok(ScanEvent::Error) => {
-                        self.app.scan_errors += 1;
-                        changed = true;
-                    }
-                    Ok(ScanEvent::Done) => {
-                        self.app.scan_done = true;
-                        changed = true;
-                        break;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        self.app.scan_done = true;
-                        changed = true;
-                        break;
-                    }
-                }
-            }
+            let app = &mut self.app;
+            let drained = scan::drain(&self.scanner, SCAN_DRAIN_BUDGET, |path, revision| {
+                app.add_path(path, revision);
+            });
+            self.app.scan_errors += drained.errors;
+            self.app.scan_done = drained.done;
+            changed |= drained.found > 0 || drained.errors > 0 || drained.done;
             changed |= self.app.integrate_pending();
         }
         for change in self.revisions.drain() {
@@ -538,7 +546,7 @@ impl Browser {
                 self.comparison_inspection.update_visible(None);
             }
             BrowserView::Inspect(_) => {
-                self.thumbnails.update_visible([]);
+                // The renderer publishes visible filmstrip thumbnails itself.
                 self.inspection.update_visible(self.inspection_key);
                 self.comparison_inspection.update_visible(None);
             }
@@ -552,27 +560,32 @@ impl Browser {
     }
 
     fn schedule_viewport(&mut self) -> bool {
-        let mut scheduled = false;
         let ids = self
             .app
-            .viewport_entry_ids(self.grid.columns, self.grid.rows, PREFETCH_ROWS)
-            .collect::<Vec<_>>();
+            .viewport_request_ids(self.grid.columns, self.grid.rows, PREFETCH_ROWS);
+        self.schedule_thumbnails(ids, self.grid.image_size)
+    }
+
+    /// Requests thumbnails of one size, beginning a new generation whenever the
+    /// requested set changes so workers skip superseded grid or strip work.
+    fn schedule_thumbnails(&mut self, ids: Vec<EntryId>, size: ratatui::layout::Size) -> bool {
         if ids != self.viewport_ids
-            || self.grid.image_size != self.viewport_size
+            || size != self.viewport_size
             || self.thumbnail_quality != self.viewport_quality
         {
             self.viewport_generation = self.thumbnails.begin_generation();
             self.viewport_ids.clone_from(&ids);
-            self.viewport_size = self.grid.image_size;
+            self.viewport_size = size;
             self.viewport_quality = self.thumbnail_quality;
         }
+        let mut scheduled = false;
         for id in ids {
             if let Some(entry) = self.app.entry(id) {
                 scheduled |= self.thumbnails.request(
                     ThumbnailKey {
                         entry_id: entry.id,
                         revision: entry.revision,
-                        size: self.grid.image_size,
+                        size,
                         quality: self.thumbnail_quality,
                     },
                     entry.path.clone(),
@@ -583,10 +596,26 @@ impl Browser {
         scheduled
     }
 
+    /// Filmstrip entries, visible cells first, then the prefetch margins.
+    fn filmstrip_ids(&self, filmstrip: FilmstripLayout) -> Vec<EntryId> {
+        let filtered = &self.app.filtered;
+        let window = filmstrip.window(self.app.selected, filtered.len());
+        let before = window.start.saturating_sub(FILMSTRIP_PREFETCH)..window.start;
+        let after = window.end..(window.end + FILMSTRIP_PREFETCH).min(filtered.len());
+        filtered[window]
+            .iter()
+            .chain(filtered[after].iter())
+            .chain(filtered[before].iter().rev())
+            .copied()
+            .collect()
+    }
+
     fn schedule_inspection(&mut self, state: ViewState) -> bool {
         let Some(entry) = self.app.selected_entry() else {
+            // An emptied filter leaves nothing to inspect.
             self.inspection_key = None;
-            return false;
+            self.view = BrowserView::Grid;
+            return true;
         };
         let key = InspectionKey {
             entry_id: entry.id,
@@ -599,7 +628,14 @@ impl Browser {
             quality: self.thumbnail_quality,
         };
         self.inspection_key = Some(key);
-        self.inspection.request(key, entry.path.clone())
+        let mut scheduled = self.inspection.request(key, entry.path.clone());
+        if self.filmstrip
+            && let Some(filmstrip) = self.filmstrip_layout
+        {
+            let ids = self.filmstrip_ids(filmstrip);
+            scheduled |= self.schedule_thumbnails(ids, filmstrip.image_size);
+        }
+        scheduled
     }
 
     fn schedule_comparison(&mut self, state: CompareState) -> bool {
@@ -813,6 +849,20 @@ impl Browser {
                     state.pan_right();
                 }
             }
+            Some(Action::PreviousOrPanLeft) => {
+                self.handle_inspect_action(Some(if self.inspection_is_fitted() {
+                    Action::PreviousImage
+                } else {
+                    Action::PanLeft
+                }))
+            }
+            Some(Action::NextOrPanRight) => {
+                self.handle_inspect_action(Some(if self.inspection_is_fitted() {
+                    Action::NextImage
+                } else {
+                    Action::PanRight
+                }))
+            }
             Some(Action::PanUp) => {
                 if let BrowserView::Inspect(state) = &mut self.view {
                     state.pan_up();
@@ -824,6 +874,7 @@ impl Browser {
                 }
             }
             Some(Action::CycleBackground) => self.background = self.background.next(),
+            Some(Action::ToggleFilmstrip) => self.filmstrip = !self.filmstrip,
             Some(Action::ToggleHelp) => self.show_help = true,
             Some(Action::ToggleDebug) => self.debug_status = !self.debug_status,
             Some(Action::ToggleMark) => self.app.toggle_mark(),
@@ -836,6 +887,10 @@ impl Browser {
             }
             _ => {}
         }
+    }
+
+    fn inspection_is_fitted(&self) -> bool {
+        matches!(self.view, BrowserView::Inspect(state) if state.zoom == Zoom::Fit)
     }
 
     fn handle_compare_action(&mut self, action: Option<Action>) {
@@ -1322,10 +1377,10 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(2);
         browser.scanner = receiver;
         sender
-            .send(ScanEvent::Found {
-                path: root.join("0-late.png"),
-                revision: SourceRevision::default(),
-            })
+            .send(ScanEvent::Found(vec![(
+                root.join("0-late.png"),
+                SourceRevision::default(),
+            )]))
             .unwrap();
         sender.send(ScanEvent::Done).unwrap();
         assert!(browser.drain_background_work());
@@ -1398,6 +1453,173 @@ mod tests {
         };
         assert_eq!(state.zoom, Zoom::Percent(200));
         assert_eq!((state.center_x, state.center_y), (5_000, 5_000));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn page_keys_follow_the_filtered_grid_order_in_detail_views() {
+        let (mut browser, root) = browser_with_images();
+        let key = |code| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::NONE,
+            })
+        };
+        let selected = |browser: &Browser| browser.app.selected_entry().unwrap().id;
+
+        browser.app.push_search('t');
+        assert_eq!(browser.app.filtered, [EntryId(1), EntryId(2)]);
+        browser.app.selected = 0;
+        assert!(browser.handle_event(key(KeyCode::Enter)));
+        assert!(matches!(browser.view, BrowserView::Inspect(_)));
+
+        assert!(browser.handle_event(key(KeyCode::PageDown)));
+        assert_eq!(selected(&browser), EntryId(2));
+        assert!(browser.handle_event(key(KeyCode::PageDown)));
+        assert_eq!(selected(&browser), EntryId(2), "no wrap at the end");
+        assert!(browser.handle_event(key(KeyCode::PageUp)));
+        assert_eq!(selected(&browser), EntryId(1));
+        assert!(browser.handle_event(key(KeyCode::Char('n'))));
+        assert_eq!(selected(&browser), EntryId(2));
+        assert!(matches!(browser.view, BrowserView::Inspect(_)));
+
+        browser.app.pop_search();
+        browser.app.selected = 0;
+        browser.view = BrowserView::Grid;
+        browser.start_comparison();
+        assert_eq!(selected(&browser), EntryId(1));
+        assert!(browser.handle_event(key(KeyCode::PageDown)));
+        assert_eq!(selected(&browser), EntryId(2));
+        assert!(browser.handle_event(key(KeyCode::PageUp)));
+        assert_eq!(selected(&browser), EntryId(1));
+        assert!(matches!(browser.view, BrowserView::Compare(_)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn arrows_browse_at_fit_and_pan_when_zoomed_while_h_and_l_always_pan() {
+        let (mut browser, root) = browser_with_images();
+        let key = |code| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::NONE,
+            })
+        };
+        let view = |browser: &Browser| match browser.view {
+            BrowserView::Inspect(state) => state,
+            _ => panic!("inspection must stay active"),
+        };
+        browser.app.selected = 0;
+        browser.view = BrowserView::Inspect(ViewState::default());
+
+        assert!(browser.handle_event(key(KeyCode::Right)));
+        assert_eq!(browser.app.selected, 1);
+        assert!(browser.handle_event(key(KeyCode::Left)));
+        assert_eq!(browser.app.selected, 0);
+        assert!(browser.handle_event(key(KeyCode::Left)));
+        assert_eq!(browser.app.selected, 0, "no wrap at the start");
+        assert!(browser.handle_event(key(KeyCode::Char('l'))));
+        assert_eq!(browser.app.selected, 0, "l pans even at fit");
+        assert!(view(&browser).center_x > 5_000);
+
+        browser.view = BrowserView::Inspect(ViewState {
+            zoom: Zoom::Percent(200),
+            ..ViewState::default()
+        });
+        assert!(browser.handle_event(key(KeyCode::Right)));
+        assert_eq!(browser.app.selected, 0, "zoomed arrows pan");
+        assert!(view(&browser).center_x > 5_000);
+        assert!(browser.handle_event(key(KeyCode::Left)));
+        assert!(browser.handle_event(key(KeyCode::Left)));
+        assert!(view(&browser).center_x < 5_000);
+        assert_eq!(browser.app.selected, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filmstrip_schedules_strip_thumbnails_and_toggles_off() {
+        use ratatui::{
+            Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect,
+        };
+
+        let (mut browser, root) = browser_with_images();
+        let terminal_with = |width, height| {
+            Terminal::with_options(
+                CrosstermBackend::new(Box::new(io::sink()) as Box<dyn io::Write + Send>),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(Rect::new(0, 0, width, height)),
+                },
+            )
+            .unwrap()
+        };
+        let mut terminal = terminal_with(80, 40);
+        browser.app.selected = 1;
+        browser.view = BrowserView::Inspect(ViewState::default());
+
+        browser.render_frame(&mut terminal).unwrap();
+        let filmstrip = browser.filmstrip_layout.expect("strip fits in 80x40");
+        let with_strip = browser.inspection_size;
+        assert!(browser.schedule_work());
+        assert_eq!(
+            browser.thumbnails.pending_count(),
+            3,
+            "all three strip cells"
+        );
+        assert_eq!(browser.viewport_size, filmstrip.image_size);
+        assert!(!browser.schedule_work(), "unchanged strip requests nothing");
+
+        browser.handle_inspect_action(Some(Action::ToggleFilmstrip));
+        browser.render_frame(&mut terminal).unwrap();
+        assert!(browser.filmstrip_layout.is_none());
+        assert!(browser.inspection_size.height > with_strip.height);
+
+        browser.handle_inspect_action(Some(Action::ToggleFilmstrip));
+        let mut small = terminal_with(80, 20);
+        browser.render_frame(&mut small).unwrap();
+        assert!(
+            browser.filmstrip_layout.is_none(),
+            "small terminals keep the image-only layout"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filmstrip_prefetches_beyond_the_visible_window_after_visible_cells() {
+        let (mut browser, root) = browser_with_images();
+        for index in 3..20 {
+            browser
+                .app
+                .add_path(root.join(format!("{index}.png")), SourceRevision::default());
+        }
+        browser.app.integrate_pending();
+        browser.app.selected = 10;
+        let filmstrip = ui::FilmstripLayout::new_for_test(ratatui::layout::Rect::new(0, 0, 42, 7));
+        let ids = browser.filmstrip_ids(filmstrip);
+        let positions = ids
+            .iter()
+            .map(|id| browser.app.filtered_position(*id).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(positions, [9, 10, 11, 12, 13, 8, 7]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspection_returns_to_the_grid_when_the_filter_becomes_empty() {
+        let (mut browser, root) = browser_with_images();
+        browser.app.selected = 0;
+        browser.view = BrowserView::Inspect(ViewState::default());
+        browser.handle_inspect_action(Some(Action::ToggleMarkedOnly));
+        assert!(browser.app.filtered.is_empty());
+        assert!(
+            browser.schedule_work(),
+            "leaving inspection needs a repaint"
+        );
+        assert!(matches!(browser.view, BrowserView::Grid));
+        assert!(browser.inspection_key.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -107,13 +107,20 @@ version 1 schema and configurable action names.
 
 ## Fullscreen inspection
 
-Escape returns from inspection to the same focused tile and scroll position.
-Use `p` and `n` to move through the current filtered ordering without returning
-to the grid. `z` switches directly between fitting the complete image and exact
-100% renderer samples; `+` and `-` step through 25, 50, 100, 200, 400, and 800%.
-At a fixed zoom, arrows or `h`, `j`, `k`, and `l` pan in bounded increments.
-Press `b` to inspect transparency against checkerboard, dark, and light
-backgrounds.
+Escape returns from inspection to the same focused tile and scroll position. Use
+`p` and `n` or PageUp and PageDown to move through the current filtered ordering
+without returning to the grid. `z` switches directly between fitting the
+complete image and exact 100% renderer samples; `+` and `-` step through 25, 50,
+100, 200, 400, and 800%. While the image is fitted, Left and Right also select
+the previous or next image. At a fixed zoom, arrows or `h`, `j`, `k`, and `l`
+pan in bounded increments. Press `b` to inspect transparency against
+checkerboard, dark, and light backgrounds.
+
+A filmstrip below the image shows the neighbouring images of the current
+filtered ordering, with the inspected image framed in red and marked images
+double-framed. Press `t` to hide or show it; `[inspection] filmstrip = false`
+starts without it. Terminals too small to keep at least ten rows for the image
+omit the strip. Strip thumbnails load in the background like grid tiles.
 
 EXIF orientation is applied consistently to thumbnails and inspection. Large or
 corrupt sources show a recoverable error view. Inspection decode, zoom, and pan
@@ -124,10 +131,10 @@ source image and obsolete rapid-navigation work is discarded.
 
 Press `c` with at least two visible images. The focused image becomes the pinned
 left `REFERENCE`; the right `CANDIDATE` starts at the next visible image, or the
-previous one when the reference was last. `p` and `n` cycle candidates while
-always skipping the reference. Enter promotes the candidate to reference and
-continues with another valid candidate. With exactly two images, the former
-reference becomes the new candidate.
+previous one when the reference was last. `p` and `n` (or PageUp and PageDown)
+cycle candidates while always skipping the reference. Enter promotes the
+candidate to reference and continues with another valid candidate. With exactly
+two images, the former reference becomes the new candidate.
 
 The red border identifies the active pane in addition to the literal role label.
 Tab changes the active pane and Space toggles that image's `[x]` mark. Press `s`
@@ -149,8 +156,10 @@ the anchor used by `v`; newly marked paths retain this interaction order.
 
 Ctrl+s restores the terminal and writes the confirmed full paths to stdout.
 `q` cancels with exit status 2 and no output. Escape in the grid is a no-op.
-Confirming no marks is a successful empty output. Use `--print0` for arbitrary
-Unix names, including names containing newlines or non-UTF-8 bytes:
+Confirming no marks is a successful empty output. Line output shows control
+characters escaped on a terminal and refuses a path containing a newline when
+written to a pipe or file. Use `--print0` for arbitrary Unix names, including
+names containing newlines or non-UTF-8 bytes:
 
 ```sh
 red-table --select --print0 ./photos > selection.paths0

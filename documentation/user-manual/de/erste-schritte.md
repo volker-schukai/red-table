@@ -115,12 +115,21 @@ vollständige Schema der Version 1 und alle Aktionsnamen.
 ## Großansicht
 
 Escape führt aus der Großansicht zur unveränderten fokussierten Kachel und
-Scrollposition zurück. `p` und `n` wechseln innerhalb der aktuellen gefilterten
-Reihenfolge zum vorherigen oder nächsten Bild. `z` schaltet direkt zwischen
-vollständigem Einpassen und exakten 100 Prozent Renderer-Pixeln um; `+` und `-`
-durchlaufen 25, 50, 100, 200, 400 und 800 Prozent. Bei festem Zoom verschieben
-Pfeile oder `h`, `j`, `k`, `l` den Ausschnitt in begrenzten Schritten. Mit `b`
-lässt sich Transparenz vor Schachbrett, dunklem oder hellem Hintergrund prüfen.
+Scrollposition zurück. `p` und `n` oder Bild ↑ und Bild ↓ (PageUp/PageDown)
+wechseln innerhalb der aktuellen gefilterten Reihenfolge zum vorherigen oder
+nächsten Bild. `z` schaltet direkt zwischen vollständigem Einpassen und exakten
+100 Prozent Renderer-Pixeln um; `+` und `-` durchlaufen 25, 50, 100, 200, 400
+und 800 Prozent. Solange das Bild eingepasst ist, wechseln auch ← und → zum
+vorherigen oder nächsten Bild. Bei festem Zoom verschieben Pfeile oder `h`, `j`,
+`k`, `l` den Ausschnitt in begrenzten Schritten. Mit `b` lässt sich Transparenz
+vor Schachbrett, dunklem oder hellem Hintergrund prüfen.
+
+Ein Filmstreifen unter dem Bild zeigt die benachbarten Bilder der aktuellen
+gefilterten Reihenfolge; das angezeigte Bild ist rot, markierte Bilder sind
+doppelt umrahmt. `t` blendet ihn aus und wieder ein; mit
+`[inspection] filmstrip = false` startet die Großansicht ohne Streifen. Bleiben
+im Terminal keine zehn Zeilen für das Bild übrig, entfällt der Streifen. Die
+Vorschaubilder laden wie die Rasterkacheln im Hintergrund.
 
 EXIF-Ausrichtung gilt einheitlich für Thumbnails und Großansicht. Zu große oder
 beschädigte Quellen erscheinen als behebbare Fehleransicht. Decoding, Zoom und
@@ -131,7 +140,8 @@ bereits überholte Eingaben werden verworfen und blockieren die Bedienung nicht.
 
 `c` öffnet bei mindestens zwei sichtbaren Bildern den Vergleich. Das fokussierte
 Bild wird zur festen linken `REFERENZ`; rechts beginnt der `KANDIDAT` beim nächsten
-sichtbaren Bild, am Listenende beim vorherigen. `p` und `n` durchlaufen die
+sichtbaren Bild, am Listenende beim vorherigen. `p` und `n` (oder Bild ↑ und
+Bild ↓) durchlaufen die
 Kandidaten und überspringen stets die Referenz. Enter macht den Kandidaten zur
 Referenz und setzt den Vergleich mit einem gültigen Kandidaten fort. Bei genau
 zwei Bildern wird die bisherige Referenz zum neuen Kandidaten.
@@ -158,8 +168,10 @@ behalten diese Interaktionsreihenfolge.
 Strg+s stellt das Terminal wieder her und schreibt die bestätigten vollständigen
 Pfade nach stdout. `q` bricht ohne Ausgabe mit Exitstatus 2 ab; Escape hat im
 Raster keine Wirkung. Eine Bestätigung ohne Markierungen ist eine erfolgreiche
-leere Ausgabe. Für beliebige Unix-Namen einschließlich Zeilenumbrüchen und
-Nicht-UTF-8-Bytes dient `--print0`:
+leere Ausgabe. Die zeilenweise Ausgabe zeigt Steuerzeichen im Terminal maskiert
+und lehnt in Pipes oder Dateien Pfade mit Zeilenumbruch ab. Für beliebige
+Unix-Namen einschließlich Zeilenumbrüchen und Nicht-UTF-8-Bytes dient
+`--print0`:
 
 ```sh
 red-table --select --print0 ./bilder > auswahl.paths0

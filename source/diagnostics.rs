@@ -7,6 +7,8 @@ use std::{
     io::{self, Write},
 };
 
+use crate::path_io::escape_controls;
+
 #[derive(Debug)]
 pub(crate) struct Diagnostic {
     message: String,
@@ -47,13 +49,13 @@ pub fn write_error(
     };
     writeln!(writer, "red-table: {error_label}:")?;
     for line in error.to_string().lines() {
-        writeln!(writer, "  {line}")?;
+        writeln!(writer, "  {}", escape_controls(line))?;
     }
     let mut source = error.source();
     while let Some(cause) = source {
         writeln!(writer, "  caused by:")?;
         for line in cause.to_string().lines() {
-            writeln!(writer, "    {line}")?;
+            writeln!(writer, "    {}", escape_controls(line))?;
         }
         source = cause.source();
     }
@@ -95,6 +97,19 @@ mod tests {
         assert!(output.starts_with("red-table: error:\n  bad config\n  line 2\n"));
         assert!(output.contains("hint: Run `red-table --help`"));
         assert!(!output.contains('\x1b'));
+    }
+
+    #[test]
+    fn file_names_cannot_inject_terminal_sequences() {
+        let error = Diagnostic::new(
+            "not a supported image or directory: /tmp/x\x1b]52;c;Zm9v\x07\r.txt".into(),
+            "Check the path.",
+        );
+        let mut bytes = Vec::new();
+        write_error(&mut bytes, &error, false).unwrap();
+        let output = String::from_utf8(bytes).unwrap();
+        assert!(!output.contains(['\x1b', '\x07', '\r']));
+        assert!(output.contains("/tmp/x\\u{1b}]52;c;Zm9v\\u{7}\\r.txt"));
     }
 
     #[test]

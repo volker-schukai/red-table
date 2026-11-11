@@ -408,6 +408,27 @@ impl App {
         self.filtered[start.min(end)..end].iter().copied()
     }
 
+    /// Thumbnail request order: visible rows, then prefetch rows below, then
+    /// prefetch rows above, so the bounded queue serves visible tiles first.
+    pub(crate) fn viewport_request_ids(
+        &self,
+        columns: usize,
+        rows: usize,
+        prefetch_rows: usize,
+    ) -> Vec<EntryId> {
+        let columns = columns.max(1);
+        let position = |row: usize| row.saturating_mul(columns).min(self.filtered.len());
+        let visible_start = position(self.row_offset);
+        let visible_end = position(self.row_offset + rows.max(1));
+        let below_end = position(self.row_offset + rows.max(1) + prefetch_rows);
+        let above_start = position(self.row_offset.saturating_sub(prefetch_rows));
+        let mut ids = Vec::with_capacity(below_end - above_start);
+        ids.extend_from_slice(&self.filtered[visible_start..visible_end]);
+        ids.extend_from_slice(&self.filtered[visible_end..below_end]);
+        ids.extend_from_slice(&self.filtered[above_start..visible_start]);
+        ids
+    }
+
     fn compare(&self, a: EntryId, b: EntryId) -> Ordering {
         match self.order {
             EntryOrder::Arrival => a.0.cmp(&b.0),
@@ -490,6 +511,39 @@ pub(crate) fn is_supported_image(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewport_requests_visible_rows_before_prefetch_rows() {
+        let mut app = App::new("/photos".into());
+        for index in 0..30 {
+            app.add_path(
+                format!("/photos/{index:02}.png").into(),
+                SourceRevision::default(),
+            );
+        }
+        app.integrate_pending();
+        app.row_offset = 2;
+        let positions = |app: &App, ids: Vec<EntryId>| {
+            ids.into_iter()
+                .map(|id| app.filtered_position(id).unwrap())
+                .collect::<Vec<_>>()
+        };
+        // 3 columns, 2 visible rows from row 2, one prefetch row on each side.
+        assert_eq!(
+            positions(&app, app.viewport_request_ids(3, 2, 1)),
+            [6, 7, 8, 9, 10, 11, 12, 13, 14, 3, 4, 5]
+        );
+        let mut sorted = app.viewport_request_ids(3, 2, 1);
+        sorted.sort_by_key(|id| app.filtered_position(*id));
+        assert_eq!(sorted, app.viewport_entry_ids(3, 2, 1).collect::<Vec<_>>());
+
+        app.row_offset = 9;
+        assert_eq!(
+            positions(&app, app.viewport_request_ids(3, 2, 1)),
+            [27, 28, 29, 24, 25, 26],
+            "clamped at the end of the collection"
+        );
+    }
 
     fn app_with_order(order: EntryOrder, names: &[&str]) -> App {
         let mut app = App::with_order("/photos".into(), order);
