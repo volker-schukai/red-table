@@ -110,7 +110,15 @@ vollständige Schema der Version 1 und alle Aktionsnamen.
 | F12 | technische Renderer-, Qualitäts-, Queue- und Cache-Daten umschalten |
 | Enter während der Suche | aktuellen Filter übernehmen |
 | Escape während der Suche | vorherigen Filter wiederherstellen |
+| `y` / `Y` | absoluten / relativen Pfad in die Zwischenablage kopieren |
 | `q` | beenden und Terminal wiederherstellen |
+
+`y` und `Y` funktionieren auch in der Großansicht. Sind Bilder markiert, werden
+alle markierten Pfade kopiert, einer je Zeile in der Reihenfolge des Markierens;
+sonst der Pfad des fokussierten Bildes. Relative Pfade beziehen sich auf den
+geöffneten Ordner. Kopiert wird über die OSC-52-Zwischenablage des Terminals,
+also auch über SSH; tmux braucht dafür `set-clipboard on`. Die Statuszeile
+bestätigt, was gesendet wurde; eine Auswahl über 64 KiB Text wird abgelehnt.
 
 ## Großansicht
 

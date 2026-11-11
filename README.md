@@ -96,6 +96,8 @@ Run `task` to list every development command.
 - `u` / `m`: clear marks / show only marked images
 - Ctrl+s: confirm paths in `--select` mode
 - `F12`: toggle renderer, quality, queue, and cache diagnostics
+- `y` / `Y`: copy the absolute / relative path of the marked images, or of the
+  focused image, to the terminal clipboard (OSC 52)
 - `q`: quit; Escape only closes or cancels the active nested view
 
 In fullscreen inspection, `p` / `n` or PageUp / PageDown select the previous /

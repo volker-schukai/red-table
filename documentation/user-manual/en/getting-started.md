@@ -103,7 +103,15 @@ version 1 schema and configurable action names.
 | F12 | toggle technical renderer, quality, queue, and cache status |
 | Enter while searching | keep the current filter |
 | Escape while searching | restore the previous filter |
+| `y` / `Y` | copy the absolute / relative path to the clipboard |
 | `q` | quit and restore the terminal |
+
+`y` and `Y` also work in fullscreen inspection. With marked images, all marked
+paths are copied, one per line in the order they were marked; otherwise the
+focused image's path. Relative paths are relative to the browsed directory. The
+copy uses the terminal's OSC 52 clipboard support, so it works over SSH; tmux
+needs `set-clipboard on`. The status line confirms what was sent; a selection
+above 64 KiB of text is refused.
 
 ## Fullscreen inspection
 

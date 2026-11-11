@@ -40,6 +40,8 @@ toggle_mark = ["Space"]
 mark_range = ["v"]
 clear_marks = ["u"]
 marked_only = ["m"]
+copy_path = ["y"]
+copy_relative_path = ["Y"]
 confirm_selection = ["Ctrl+s"]
 search = ["/"]
 thumbnail_larger = ["+", "="]
@@ -92,6 +94,8 @@ toggle_mark = ["Space"]
 mark_range = ["v"]
 clear_marks = ["u"]
 marked_only = ["m"]
+copy_path = ["y"]
+copy_relative_path = ["Y"]
 confirm_selection = ["Ctrl+s"]
 
 [keys.compare]
@@ -140,6 +144,11 @@ cache. Its value is in mebibytes. Transparent images are composited onto the
 configured initial background; `background` cycles the three modes at runtime.
 `filmstrip` sets whether inspection starts with the thumbnail strip; the
 `filmstrip` action toggles it for the session.
+
+`copy_path` and `copy_relative_path` send the marked images' paths, or the
+focused image's path when nothing is marked, to the terminal clipboard through
+OSC 52. Relative paths are relative to the browsed directory. The terminal must
+allow clipboard writes; tmux additionally needs `set-clipboard on`.
 
 Selection actions are available in normal and inspection contexts. The
 `confirm_selection` action ends only a `--select` session; it is inert during a

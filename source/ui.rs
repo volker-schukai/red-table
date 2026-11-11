@@ -38,6 +38,7 @@ pub(crate) struct RenderOptions<'a> {
     pub(crate) show_help: bool,
     pub(crate) debug_status: bool,
     pub(crate) selection_mode: bool,
+    pub(crate) notice: Option<&'a str>,
 }
 
 const FILMSTRIP_CELL_WIDTH: u16 = 14;
@@ -172,19 +173,23 @@ pub(crate) fn render_grid(
         areas[0],
         options,
     );
-    render_grid_cards(frame, app, thumbnails, grid, options.thumbnail_quality);
-    render_footer(
+    let context = match app.mode {
+        InputMode::Normal => ActionContext::Normal,
+        InputMode::Search => ActionContext::Search,
+    };
+    let overlay = options
+        .show_help
+        .then(|| help_area(frame.area(), options.bindings, context));
+    render_grid_cards(
         frame,
         app,
-        options.bindings,
-        options.selection_mode,
-        areas[2],
+        thumbnails,
+        grid,
+        options.thumbnail_quality,
+        overlay,
     );
+    render_footer(frame, app, options, areas[2]);
     if options.show_help {
-        let context = match app.mode {
-            InputMode::Normal => ActionContext::Normal,
-            InputMode::Search => ActionContext::Search,
-        };
         render_help(frame, options.bindings, context);
     }
     grid
@@ -259,6 +264,7 @@ fn render_grid_cards(
     thumbnails: &mut Thumbnails,
     grid: GridLayout,
     thumbnail_quality: ThumbnailQuality,
+    overlay: Option<Rect>,
 ) {
     if app.filtered.is_empty() {
         let message = if app.scan_done {
@@ -317,7 +323,9 @@ fn render_grid_cards(
             quality: thumbnail_quality,
         };
         match thumbnails.display(key) {
-            ThumbnailDisplay::Ready(thumbnail) => render_prepared(frame, thumbnail, image_area),
+            ThumbnailDisplay::Ready(thumbnail) => {
+                render_prepared(frame, thumbnail, image_area, overlay);
+            }
             ThumbnailDisplay::Loading => frame.render_widget(
                 Paragraph::new("loading…")
                     .alignment(Alignment::Center)
@@ -377,13 +385,19 @@ fn grid_label(app: &App, entry: &crate::app::ImageEntry) -> String {
     }
 }
 
-fn render_footer(
-    frame: &mut Frame<'_>,
-    app: &App,
-    bindings: &Bindings,
-    selection_mode: bool,
-    area: Rect,
-) {
+/// The status line below a view: a pending notice, otherwise the key hints.
+fn status_line(notice: Option<&str>, help: String) -> Line<'static> {
+    match notice {
+        Some(notice) => Line::from(Span::styled(
+            format!(" {notice}"),
+            Style::default().fg(Color::Yellow),
+        )),
+        None => Line::from(Span::styled(help, Style::default().fg(Color::DarkGray))),
+    }
+}
+
+fn render_footer(frame: &mut Frame<'_>, app: &App, options: RenderOptions<'_>, area: Rect) {
+    let (bindings, selection_mode) = (options.bindings, options.selection_mode);
     let selected_path = app
         .selected_entry()
         .map(|entry| entry.path.to_string_lossy())
@@ -418,15 +432,12 @@ fn render_footer(
         InputMode::Search => format!("/{}█", app.query),
     };
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(input),
-            Line::from(Span::styled(help, Style::default().fg(Color::DarkGray))),
-        ]),
+        Paragraph::new(vec![Line::from(input), status_line(options.notice, help)]),
         area,
     );
 }
 
-fn render_help(frame: &mut Frame<'_>, bindings: &Bindings, context: ActionContext) {
+fn help_lines(bindings: &Bindings, context: ActionContext) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         "Effective key bindings",
         Style::default().add_modifier(Modifier::BOLD),
@@ -434,18 +445,25 @@ fn render_help(frame: &mut Frame<'_>, bindings: &Bindings, context: ActionContex
     lines.extend(bindings.help_lines(context).into_iter().map(Line::from));
     lines.push(Line::from(""));
     lines.push(Line::from("Esc closes this help"));
+    lines
+}
 
-    let screen = frame.area();
+/// Screen area the help overlay covers; images below it must know it.
+fn help_area(screen: Rect, bindings: &Bindings, context: ActionContext) -> Rect {
+    let lines = bindings.help_lines(context).len() as u16 + 3;
     let width = screen.width.saturating_sub(4).clamp(1, 72);
-    let height = (lines.len() as u16 + 2)
-        .min(screen.height.saturating_sub(2))
-        .max(1);
-    let area = Rect::new(
+    let height = (lines + 2).min(screen.height.saturating_sub(2)).max(1);
+    Rect::new(
         screen.x + screen.width.saturating_sub(width) / 2,
         screen.y + screen.height.saturating_sub(height) / 2,
         width,
         height,
-    );
+    )
+}
+
+fn render_help(frame: &mut Frame<'_>, bindings: &Bindings, context: ActionContext) {
+    let lines = help_lines(bindings, context);
+    let area = help_area(frame.area(), bindings, context);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -469,6 +487,7 @@ pub(crate) struct InspectionOptions<'a> {
     pub(crate) selection_mode: bool,
     pub(crate) filmstrip: bool,
     pub(crate) thumbnail_quality: ThumbnailQuality,
+    pub(crate) notice: Option<&'a str>,
 }
 
 fn filmstrip_height(enabled: bool, area: Rect) -> u16 {
@@ -497,7 +516,17 @@ pub(crate) fn render_inspection(
         ])
         .split(frame.area());
     let filmstrip = (areas[2].height > 0).then(|| FilmstripLayout::new(areas[2]));
-    render_filmstrip(frame, app, thumbnails, filmstrip, options.thumbnail_quality);
+    let overlay = options
+        .show_help
+        .then(|| help_area(frame.area(), options.bindings, ActionContext::Inspect));
+    render_filmstrip(
+        frame,
+        app,
+        thumbnails,
+        filmstrip,
+        options.thumbnail_quality,
+        overlay,
+    );
     let selected = if app.filtered.is_empty() {
         0
     } else {
@@ -543,7 +572,7 @@ pub(crate) fn render_inspection(
                 .style(Style::default().fg(Color::DarkGray)),
             areas[1],
         ),
-        InspectionDisplay::Ready(prepared) => render_prepared(frame, prepared, areas[1]),
+        InspectionDisplay::Ready(prepared) => render_prepared(frame, prepared, areas[1], overlay),
         InspectionDisplay::Error(error) => frame.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
@@ -589,7 +618,7 @@ pub(crate) fn render_inspection(
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(path.into_owned()),
-            Line::from(Span::styled(help, Style::default().fg(Color::DarkGray))),
+            status_line(options.notice, help),
         ]),
         areas[3],
     );
@@ -610,6 +639,7 @@ fn render_filmstrip(
     thumbnails: &mut Thumbnails,
     filmstrip: Option<FilmstripLayout>,
     thumbnail_quality: ThumbnailQuality,
+    overlay: Option<Rect>,
 ) {
     let Some(filmstrip) = filmstrip else {
         thumbnails.update_visible([]);
@@ -635,7 +665,7 @@ fn render_filmstrip(
         let inner = block.inner(outer);
         frame.render_widget(block, outer);
         match thumbnails.display(key(entry)) {
-            ThumbnailDisplay::Ready(thumbnail) => render_prepared(frame, thumbnail, inner),
+            ThumbnailDisplay::Ready(thumbnail) => render_prepared(frame, thumbnail, inner, overlay),
             ThumbnailDisplay::Loading => frame.render_widget(
                 Paragraph::new("…")
                     .alignment(Alignment::Center)
@@ -711,6 +741,9 @@ pub(crate) fn render_comparison(
         areas[0],
     );
 
+    let overlay = options
+        .show_help
+        .then(|| help_area(frame.area(), options.bindings, ActionContext::Compare));
     let reference_size = render_comparison_pane(
         frame,
         panes[0],
@@ -722,6 +755,7 @@ pub(crate) fn render_comparison(
         options.state.active == ComparePane::Reference,
         options.state.reference_view,
         options.reference_display,
+        overlay,
     );
     let candidate_size = render_comparison_pane(
         frame,
@@ -734,6 +768,7 @@ pub(crate) fn render_comparison(
         options.state.active == ComparePane::Candidate,
         options.state.candidate_view,
         options.candidate_display,
+        overlay,
     );
 
     let mut help = format!(
@@ -797,6 +832,7 @@ fn render_comparison_pane(
     active: bool,
     view: ViewState,
     display: InspectionDisplay<'_>,
+    overlay: Option<Rect>,
 ) -> Size {
     let title = format!(
         " {role} · {} · {} · {} ",
@@ -821,7 +857,7 @@ fn render_comparison_pane(
                 .style(Style::default().fg(Color::DarkGray)),
             inner,
         ),
-        InspectionDisplay::Ready(prepared) => render_prepared(frame, prepared, inner),
+        InspectionDisplay::Ready(prepared) => render_prepared(frame, prepared, inner, overlay),
         InspectionDisplay::Error(error) => frame.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
@@ -837,7 +873,13 @@ fn render_comparison_pane(
     Size::new(inner.width, inner.height)
 }
 
-fn render_prepared(frame: &mut Frame<'_>, prepared: &PreparedThumbnail, area: Rect) {
+/// `overlay` is the help area drawn over the image afterwards, if any.
+fn render_prepared(
+    frame: &mut Frame<'_>,
+    prepared: &PreparedThumbnail,
+    area: Rect,
+    overlay: Option<Rect>,
+) {
     match prepared {
         PreparedThumbnail::Standard(protocol) => {
             if let Some(placeholder) = protocol.needs_placeholder(area) {
@@ -847,7 +889,7 @@ fn render_prepared(frame: &mut Frame<'_>, prepared: &PreparedThumbnail, area: Re
             }
         }
         PreparedThumbnail::Kitty(protocol) => {
-            frame.render_widget(KittyImage::new(protocol), area);
+            frame.render_widget(KittyImage::new(protocol).occluded(overlay), area);
         }
     }
 }
@@ -859,6 +901,93 @@ mod tests {
     use crate::{app::SourceRevision, settings::DEFAULT_THUMBNAIL_SIZE};
 
     use super::*;
+
+    #[test]
+    fn help_owns_its_lines_over_kitty_thumbnails_in_the_grid() {
+        use image::DynamicImage;
+        use ratatui::{Terminal, backend::TestBackend};
+        use ratatui_image::picker::Picker;
+
+        use crate::kitty::{KittyProtocol, KittySession};
+
+        let mut app = App::new("/photos".into());
+        for index in 0..4 {
+            app.add_path(
+                format!("/photos/{index}.png").into(),
+                SourceRevision::default(),
+            );
+        }
+        app.integrate_pending();
+        let session = KittySession::with_tmux(false);
+        let mut thumbnails = Thumbnails::with_session(Picker::halfblocks(), session.clone());
+        let bindings = Bindings::built_in();
+        let screen = Rect::new(0, 0, 80, 40);
+        let grid = GridLayout::new_for_test(screen, DEFAULT_THUMBNAIL_SIZE);
+        let quality = "7".parse().unwrap();
+        for id in app.filtered.clone() {
+            thumbnails.insert(
+                ThumbnailKey {
+                    entry_id: id,
+                    revision: SourceRevision::default(),
+                    size: grid.image_size,
+                    quality,
+                },
+                PreparedThumbnail::Kitty(
+                    KittyProtocol::new(
+                        DynamicImage::new_rgb8(8, 8),
+                        grid.image_size,
+                        session.clone(),
+                    )
+                    .unwrap(),
+                ),
+            );
+        }
+        let mut terminal = Terminal::new(TestBackend::new(screen.width, screen.height)).unwrap();
+        let mut draw = |show_help| {
+            terminal
+                .draw(|frame| {
+                    render_grid(
+                        frame,
+                        &mut app,
+                        &mut thumbnails,
+                        RenderOptions {
+                            protocol_name: "Kitty",
+                            thumbnail_size: DEFAULT_THUMBNAIL_SIZE,
+                            thumbnail_quality: quality,
+                            bindings: &bindings,
+                            show_help,
+                            debug_status: false,
+                            selection_mode: false,
+                            notice: None,
+                        },
+                    );
+                })
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+
+        let row_symbols = |buffer: &Buffer, lines: std::ops::Range<u16>| {
+            lines
+                .flat_map(|y| (0..screen.width).map(move |x| (x, y)))
+                .filter(|position| buffer[*position].symbol().contains("\x1b[s"))
+                .count()
+        };
+        let without_help = draw(false);
+        assert!(
+            row_symbols(&without_help, 0..screen.height) > 0,
+            "the grid must show Kitty row symbols for this test to mean anything"
+        );
+
+        let help = help_area(screen, &bindings, ActionContext::Normal);
+        let with_help = draw(true);
+        assert_eq!(
+            row_symbols(&with_help, help.top()..help.bottom()),
+            0,
+            "a row symbol on a help line would repaint over the help"
+        );
+        assert_eq!(with_help[(help.x + 1, help.y + 1)].symbol(), "E");
+        assert_eq!(with_help[(help.x, help.y + 1)].symbol(), "│");
+    }
 
     #[test]
     fn larger_target_dimensions_reduce_grid_density() {

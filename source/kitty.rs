@@ -15,6 +15,7 @@ use image::DynamicImage;
 use ratatui::{
     buffer::{Buffer, CellDiffOption},
     layout::{Rect, Size},
+    style::Color,
     widgets::Widget,
 };
 use ratatui_image::picker::cap_parser::Parser;
@@ -231,7 +232,10 @@ impl KittyProtocol {
             && !self.needs_transmission.swap(true, Ordering::AcqRel)
     }
 
-    fn render(&self, area: Rect, buffer: &mut Buffer) {
+    /// `occluded` is an overlay drawn after this image. Rows on its lines are
+    /// rendered cell by cell so the overlay replaces exactly the cells it
+    /// covers; a row symbol would repaint the whole row over it.
+    fn render(&self, area: Rect, buffer: &mut Buffer, occluded: Option<Rect>) {
         let size = self.size();
         let width = area.width.min(size.width);
         let height = area
@@ -242,10 +246,12 @@ impl KittyProtocol {
             return;
         }
 
-        let transmission = self
-            .needs_transmission
-            .swap(false, Ordering::AcqRel)
-            .then_some(self.transmission.as_str());
+        let occluded = occluded.filter(|overlay| overlay.intersects(area));
+        // The first cell carries the transmission; hidden, it stays pending.
+        let carrier_hidden = occluded.is_some_and(|overlay| overlay.contains(area.as_position()));
+        let transmission = (!carrier_hidden
+            && self.needs_transmission.swap(false, Ordering::AcqRel))
+        .then_some(self.transmission.as_str());
         if transmission.is_some() {
             self.ever_transmitted.store(true, Ordering::Release);
             self.session
@@ -259,12 +265,31 @@ impl KittyProtocol {
         let down = area.height.saturating_sub(1);
         let restore_cursor = format!("\x1b[u\x1b[{right}C\x1b[{down}B");
 
+        let [_, red, green, blue] = self.id.to_be_bytes();
         for row in 0..height {
             let mut symbol = String::new();
             if row == 0
                 && let Some(transmission) = transmission
             {
                 symbol.push_str(transmission);
+            }
+            let y = area.y + row;
+            if occluded.is_some_and(|overlay| (overlay.top()..overlay.bottom()).contains(&y)) {
+                for column in 0..width {
+                    // Columns beyond the diacritic table stay blank.
+                    let (Some(cell), Some(column_mark)) = (
+                        buffer.cell_mut((area.x + column, y)),
+                        ROW_DIACRITICS.get(usize::from(column)),
+                    ) else {
+                        continue;
+                    };
+                    symbol.extend([PLACEHOLDER, ROW_DIACRITICS[usize::from(row)], *column_mark]);
+                    cell.set_symbol(&symbol)
+                        .set_fg(Color::Rgb(red, green, blue))
+                        .set_diff_option(UNIT_WIDTH);
+                    symbol.clear();
+                }
+                continue;
             }
             write!(
                 symbol,
@@ -299,17 +324,27 @@ impl Drop for KittyProtocol {
 
 pub(crate) struct KittyImage<'a> {
     protocol: &'a KittyProtocol,
+    occluded: Option<Rect>,
 }
 
 impl<'a> KittyImage<'a> {
     pub(crate) const fn new(protocol: &'a KittyProtocol) -> Self {
-        Self { protocol }
+        Self {
+            protocol,
+            occluded: None,
+        }
+    }
+
+    /// Declares an overlay that is drawn over this image afterwards.
+    pub(crate) const fn occluded(mut self, overlay: Option<Rect>) -> Self {
+        self.occluded = overlay;
+        self
     }
 }
 
 impl Widget for KittyImage<'_> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
-        self.protocol.render(area, buffer);
+        self.protocol.render(area, buffer, self.occluded);
     }
 }
 
@@ -831,6 +866,95 @@ mod tests {
         let (payload, compressed) = compress_payload(noise.clone());
         assert!(!compressed);
         assert_eq!(payload, noise);
+    }
+
+    fn test_protocol(width: u16, height: u16) -> KittyProtocol {
+        KittyProtocol::new(
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(4, 4, Rgba([10, 20, 30, 255]))),
+            Size::new(width, height),
+            KittySession::with_tmux(false),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rows_under_an_overlay_render_cell_by_cell_and_other_rows_are_unchanged() {
+        let area = Rect::new(2, 1, 6, 4);
+        // Covers image columns 4..8 on lines 2 and 3, like a centred help box.
+        let overlay = Rect::new(4, 2, 10, 2);
+        let protocol = test_protocol(6, 4);
+        let mut plain = Buffer::empty(Rect::new(0, 0, 16, 6));
+        protocol.render(area, &mut plain, None);
+        protocol.rearm();
+        let mut occluded = Buffer::empty(Rect::new(0, 0, 16, 6));
+        protocol.render(area, &mut occluded, Some(overlay));
+
+        for y in [1, 4] {
+            for x in 0..16 {
+                assert_eq!(
+                    occluded[(x, y)],
+                    plain[(x, y)],
+                    "line {y} keeps the row form"
+                );
+            }
+        }
+        assert!(occluded[(2, 1)].symbol().contains("a=T,U=1"));
+        let [_, red, green, blue] = protocol.id().to_be_bytes();
+        for (row, y) in [(1_usize, 2_u16), (2, 3)] {
+            for column in 0..6_u16 {
+                let cell = &occluded[(area.x + column, y)];
+                assert_eq!(
+                    cell.symbol(),
+                    String::from_iter([
+                        PLACEHOLDER,
+                        ROW_DIACRITICS[row],
+                        ROW_DIACRITICS[usize::from(column)]
+                    ]),
+                    "one positioned placeholder per cell and no cursor control"
+                );
+                assert_eq!(cell.fg, Color::Rgb(red, green, blue));
+                assert_eq!(cell.diff_option, UNIT_WIDTH);
+            }
+        }
+
+        // The overlay then owns exactly its cells; nothing paints across it.
+        ratatui::widgets::Clear.render(overlay, &mut occluded);
+        for y in 2..4 {
+            for x in 0..16 {
+                let symbol = occluded[(x, y)].symbol();
+                assert!(!symbol.contains('\x1b'), "({x},{y}) holds {symbol:?}");
+                assert_eq!(symbol == " ", !(2..4).contains(&x), "({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_hidden_first_cell_defers_the_transmission_until_it_is_visible() {
+        let area = Rect::new(4, 2, 4, 2);
+        let protocol = test_protocol(4, 2);
+        let session_transmissions = || protocol.session.inner.transmissions.load(Ordering::Acquire);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 6));
+        protocol.render(area, &mut buffer, Some(Rect::new(3, 1, 4, 4)));
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .all(|cell| !cell.symbol().contains("a=T")),
+            "a transmission in a covered cell would be lost"
+        );
+        assert_eq!(session_transmissions(), 0);
+        assert!(!protocol.rearm(), "the image was never transmitted");
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 6));
+        protocol.render(area, &mut buffer, None);
+        assert!(buffer[(4, 2)].symbol().contains("a=T,U=1"));
+        assert_eq!(session_transmissions(), 1);
+
+        // An overlay elsewhere on the screen changes nothing.
+        protocol.rearm();
+        let mut far = Buffer::empty(Rect::new(0, 0, 16, 6));
+        protocol.render(area, &mut far, Some(Rect::new(12, 5, 2, 1)));
+        assert_eq!(far, buffer);
     }
 
     #[test]

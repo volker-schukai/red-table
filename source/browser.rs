@@ -12,6 +12,7 @@ use crate::{
     BoxError,
     actions::{Action, ActionContext, Bindings},
     app::{App, EntryId, InputMode, SourceRevision, is_supported_image},
+    clipboard,
     config::RuntimeSettings,
     graphics,
     inspection::{DecodedSources, Inspection, InspectionDisplay, InspectionKey, ViewState, Zoom},
@@ -174,6 +175,10 @@ struct Browser {
     selection_mode: bool,
     confirmed: bool,
     repaint_nudges: Vec<Instant>,
+    /// OSC 52 sequence waiting to be written outside frame rendering.
+    pending_clipboard: Option<String>,
+    /// Status shown until the next key press.
+    notice: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -304,6 +309,8 @@ impl Browser {
             selection_mode,
             confirmed: false,
             repaint_nudges: Vec::new(),
+            pending_clipboard: None,
+            notice: None,
         }
     }
 
@@ -315,6 +322,7 @@ impl Browser {
             self.schedule_revision_check(frame_started);
             dirty |= self.kitty_session.drain_cleanup(terminal.backend_mut())? > 0;
             self.write_due_repaint_nudges(terminal.backend_mut(), frame_started)?;
+            self.write_pending_clipboard(terminal.backend_mut())?;
             if dirty {
                 self.render_frame(terminal)?;
                 dirty = self.schedule_work();
@@ -366,6 +374,47 @@ impl Browser {
         Ok(due)
     }
 
+    fn write_pending_clipboard(&mut self, writer: &mut dyn io::Write) -> io::Result<()> {
+        if let Some(sequence) = self.pending_clipboard.take() {
+            writer.write_all(sequence.as_bytes())?;
+            writer.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Queues the marked images' paths, or the focused image's path, for the
+    /// terminal clipboard and reports the result in the notice.
+    fn copy_paths(&mut self, relative: bool) {
+        let paths = if self.app.marked_count() > 0 {
+            self.app.marked_paths()
+        } else {
+            self.app
+                .selected_entry()
+                .map(|entry| entry.path.to_path_buf())
+                .into_iter()
+                .collect()
+        };
+        if paths.is_empty() {
+            self.notice = Some("nothing to copy".into());
+            return;
+        }
+        let text = clipboard::text(&paths, relative.then_some(self.app.root.as_path()));
+        if text.len() > clipboard::MAX_TEXT_BYTES {
+            self.notice = Some(format!(
+                "{} paths exceed the {} KiB clipboard limit; nothing was sent",
+                paths.len(),
+                clipboard::MAX_TEXT_BYTES / 1024
+            ));
+            return;
+        }
+        self.pending_clipboard = Some(clipboard::osc52(&text));
+        let kind = if relative { "relative" } else { "absolute" };
+        self.notice = Some(match paths.len() {
+            1 => format!("sent the {kind} path to the terminal clipboard"),
+            count => format!("sent {count} {kind} paths to the terminal clipboard"),
+        });
+    }
+
     /// Draws one frame and, when it transmitted Kitty image data, schedules
     /// the repaint nudges so the new placements are painted without input.
     fn render_frame(&mut self, terminal: &mut AppTerminal) -> Result<(), BoxError> {
@@ -392,6 +441,7 @@ impl Browser {
                         show_help: self.show_help,
                         debug_status: self.debug_status,
                         selection_mode: self.selection_mode,
+                        notice: self.notice.as_deref(),
                     },
                 );
             }
@@ -415,6 +465,7 @@ impl Browser {
                         selection_mode: self.selection_mode,
                         filmstrip: self.filmstrip,
                         thumbnail_quality: self.thumbnail_quality,
+                        notice: self.notice.as_deref(),
                     },
                 );
                 self.inspection_size = layout.image_size;
@@ -696,6 +747,7 @@ impl Browser {
             self.running = false;
             return false;
         }
+        self.notice = None;
 
         let context = match self.view {
             BrowserView::Inspect(_) => ActionContext::Inspect,
@@ -774,6 +826,8 @@ impl Browser {
             Some(Action::MarkRange) => self.app.mark_range(),
             Some(Action::ClearMarks) => self.app.clear_marks(),
             Some(Action::ToggleMarkedOnly) => self.app.toggle_marked_only(),
+            Some(Action::CopyPath) => self.copy_paths(false),
+            Some(Action::CopyRelativePath) => self.copy_paths(true),
             Some(Action::ConfirmSelection) if self.selection_mode => {
                 self.confirmed = true;
                 self.running = false;
@@ -881,6 +935,8 @@ impl Browser {
             Some(Action::MarkRange) => self.app.mark_range(),
             Some(Action::ClearMarks) => self.app.clear_marks(),
             Some(Action::ToggleMarkedOnly) => self.app.toggle_marked_only(),
+            Some(Action::CopyPath) => self.copy_paths(false),
+            Some(Action::CopyRelativePath) => self.copy_paths(true),
             Some(Action::ConfirmSelection) if self.selection_mode => {
                 self.confirmed = true;
                 self.running = false;
@@ -1537,6 +1593,168 @@ mod tests {
         assert!(browser.handle_event(key(KeyCode::Left)));
         assert!(view(&browser).center_x < 5_000);
         assert_eq!(browser.app.selected, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Writes the pending clipboard sequence and returns the text it carries.
+    fn clipboard_text(browser: &mut Browser) -> Option<String> {
+        let mut output = Vec::new();
+        browser.write_pending_clipboard(&mut output).unwrap();
+        if output.is_empty() {
+            return None;
+        }
+        let sequence = String::from_utf8(output).unwrap();
+        let payload = sequence
+            .strip_prefix("\x1b]52;c;")
+            .and_then(|rest| rest.strip_suffix("\x1b\\"))
+            .expect("one complete OSC 52 sequence");
+        Some(String::from_utf8(base64_simd::STANDARD.decode_to_vec(payload).unwrap()).unwrap())
+    }
+
+    #[test]
+    fn copy_keys_send_marked_or_focused_paths_and_show_a_notice() {
+        let (mut browser, root) = browser_with_images();
+        let key = |code, modifiers| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::NONE,
+            })
+        };
+        let absolute = |name: &str| root.join(name).to_string_lossy().into_owned();
+        browser.app.selected = 1;
+
+        assert!(browser.handle_event(key(KeyCode::Char('y'), KeyModifiers::NONE)));
+        assert_eq!(clipboard_text(&mut browser), Some(absolute("2-two.png")));
+        assert_eq!(
+            browser.notice.as_deref(),
+            Some("sent the absolute path to the terminal clipboard")
+        );
+        assert_eq!(clipboard_text(&mut browser), None, "written exactly once");
+
+        assert!(browser.handle_event(key(KeyCode::Char('Y'), KeyModifiers::SHIFT)));
+        assert_eq!(clipboard_text(&mut browser), Some("2-two.png".into()));
+
+        // Marks take precedence over focus, in mark order, also in inspection.
+        browser.app.toggle_mark_id(EntryId(2));
+        browser.app.toggle_mark_id(EntryId(0));
+        browser.view = BrowserView::Inspect(ViewState::default());
+        assert!(browser.handle_event(key(KeyCode::Char('Y'), KeyModifiers::SHIFT)));
+        assert_eq!(
+            clipboard_text(&mut browser),
+            Some("3-three.png\n1-one.png".into())
+        );
+        assert_eq!(
+            browser.notice.as_deref(),
+            Some("sent 2 relative paths to the terminal clipboard")
+        );
+        assert!(browser.handle_event(key(KeyCode::Char('y'), KeyModifiers::NONE)));
+        assert_eq!(
+            clipboard_text(&mut browser),
+            Some(format!(
+                "{}\n{}",
+                absolute("3-three.png"),
+                absolute("1-one.png")
+            ))
+        );
+
+        assert!(browser.handle_event(key(KeyCode::Char('b'), KeyModifiers::NONE)));
+        assert!(browser.notice.is_none(), "the next key clears the notice");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copy_refuses_empty_and_oversized_selections_without_writing() {
+        let (mut browser, root) = browser_with_images();
+        let long_name = "x".repeat(200);
+        for index in 0..400 {
+            let id = browser.app.add_path(
+                root.join(format!("{long_name}-{index}.png")),
+                SourceRevision::default(),
+            );
+            browser.app.integrate_pending();
+            browser.app.toggle_mark_id(id);
+        }
+        browser.copy_paths(false);
+        assert_eq!(clipboard_text(&mut browser), None);
+        assert!(
+            browser
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("400 paths exceed the 64 KiB")),
+            "{:?}",
+            browser.notice
+        );
+
+        browser.app.clear_marks();
+        browser.app.push_search('#');
+        assert!(browser.app.filtered.is_empty());
+        browser.copy_paths(true);
+        assert_eq!(clipboard_text(&mut browser), None);
+        assert_eq!(browser.notice.as_deref(), Some("nothing to copy"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn notices_replace_the_key_hints_in_grid_and_inspection() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut browser, root) = browser_with_images();
+        browser.notice = Some("sent the absolute path to the terminal clipboard".into());
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let mut last_line = |browser: &mut Browser, inspect: bool| {
+            terminal
+                .draw(|frame| {
+                    if inspect {
+                        ui::render_inspection(
+                            frame,
+                            &browser.app,
+                            &mut browser.thumbnails,
+                            InspectionOptions {
+                                display: InspectionDisplay::Loading,
+                                state: ViewState::default(),
+                                background: browser.background,
+                                bindings: &browser.bindings,
+                                show_help: false,
+                                debug_status: false,
+                                protocol_name: "test",
+                                selection_mode: false,
+                                filmstrip: false,
+                                thumbnail_quality: browser.thumbnail_quality,
+                                notice: browser.notice.as_deref(),
+                            },
+                        );
+                    } else {
+                        ui::render_grid(
+                            frame,
+                            &mut browser.app,
+                            &mut browser.thumbnails,
+                            RenderOptions {
+                                protocol_name: "test",
+                                thumbnail_size: browser.thumbnail_size,
+                                thumbnail_quality: browser.thumbnail_quality,
+                                bindings: &browser.bindings,
+                                show_help: false,
+                                debug_status: false,
+                                selection_mode: false,
+                                notice: browser.notice.as_deref(),
+                            },
+                        );
+                    }
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..80)
+                .map(|x| buffer[(x, 29)].symbol().to_owned())
+                .collect::<String>()
+        };
+        for inspect in [false, true] {
+            let line = last_line(&mut browser, inspect);
+            assert!(line.contains("sent the absolute path"), "{line}");
+        }
+        browser.notice = None;
+        assert!(last_line(&mut browser, false).contains("help"));
         fs::remove_dir_all(root).unwrap();
     }
 

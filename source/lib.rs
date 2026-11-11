@@ -2,6 +2,7 @@ mod actions;
 mod app;
 mod browser;
 mod cli;
+mod clipboard;
 mod config;
 pub mod diagnostics;
 mod graphics;

@@ -98,6 +98,8 @@ mit den eingebauten Werten.
 - `u` / `m`: Markierungen löschen / nur markierte Bilder anzeigen
 - Strg+s: Pfade im Modus `--select` bestätigen
 - `F12`: Renderer-, Qualitäts-, Queue- und Cache-Diagnose umschalten
+- `y` / `Y`: absoluten / relativen Pfad der markierten Bilder, sonst des
+  fokussierten Bildes, in die Terminal-Zwischenablage kopieren (OSC 52)
 - `q`: beenden; Escape schließt nur die aktive Unteransicht oder bricht sie ab
 
 In der Großansicht wechseln `p` / `n` oder Bild ↑ / Bild ↓ zum vorherigen /
