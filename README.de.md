@@ -172,6 +172,8 @@ außerhalb offener Anführungszeichen ist. Weitere Einrichtungshinweise und eige
 Tastenkürzel beschreibt das [Handbuch](documentation/user-manual/de/erste-schritte.md#shell-integration).
 Der Befehl gibt Skripte aus und ändert keine Startdateien.
 
+In Bash funktioniert `Alt+i` sowohl im Emacs- als auch im Vi-Einfügemodus.
+
 ## Yazi-Plugin
 
 Das installierbare funktionale Plugin [`red-table.yazi`](red-table.yazi/) öffnet

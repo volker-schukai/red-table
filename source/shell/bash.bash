@@ -62,5 +62,5 @@ _red_table_pick() {
 }
 if [[ $- == *i* ]]; then
     bind -m emacs-standard -x '"\ei":_red_table_pick'
-    bind -m vi-insertion -x '"\ei":_red_table_pick'
+    bind -m vi-insert -x '"\ei":_red_table_pick'
 fi

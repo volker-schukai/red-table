@@ -166,6 +166,8 @@ prefix. See the [shell integration guide](documentation/user-manual/en/getting-s
 for setup and custom bindings. The command prints scripts; it does not edit your
 startup files.
 
+In Bash, `Alt+i` works in both Emacs and Vi insert mode.
+
 ## Yazi plugin
 
 The installable [`red-table.yazi`](red-table.yazi/) functional plugin opens the

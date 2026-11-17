@@ -394,13 +394,14 @@ exit [lindex $result 3]
 
 #[test]
 fn bash_and_fish_alt_i_bindings_insert_into_the_real_command_buffer() {
-    for shell in ["bash", "fish"] {
+    for (shell, edit_mode) in [("bash", "vi"), ("bash", "emacs"), ("fish", "default")] {
         let fixture = Fixture::new(shell);
         fs::write(fixture.root.join("settings with spaces.toml"), b"").unwrap();
         fs::write(fixture.root.join("paths"), b"/photos/a b.png\0").unwrap();
         let init = if shell == "bash" {
             r#"
-source "$TEST_ROOT/init"
+set -o "$TEST_EDIT_MODE"
+source "$TEST_ROOT/init" 2>"$TEST_ROOT/init-errors"
 _red_table_test_dump() {
     printf '%s' "$READLINE_LINE" > "$TEST_ROOT/buffer-next"
     command mv -- "$TEST_ROOT/buffer-next" "$TEST_ROOT/buffer"
@@ -473,13 +474,22 @@ exit [lindex $result 3]
             .command("expect")
             .args(["-c", &checked_expect(script)])
             .env("TEST_SHELL", shell)
+            .env("TEST_EDIT_MODE", edit_mode)
             .env("TEST_STATUS", "0")
             .env("TERM", "xterm-256color")
             .output()
             .unwrap();
+        if shell == "bash" {
+            let errors = fs::read(fixture.root.join("init-errors")).unwrap();
+            assert!(
+                errors.is_empty(),
+                "Bash {edit_mode} initialization diagnostics: {}",
+                String::from_utf8_lossy(&errors)
+            );
+        }
         assert!(
             output.status.success(),
-            "{shell}: {}\n{}",
+            "{shell}/{edit_mode}: {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
