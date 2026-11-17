@@ -10,7 +10,12 @@ local MAX_NOTIFICATION_BYTES = 4096
 local snapshot = ya.sync(function(state)
   local cwd = cx.active.current.cwd
   local modern = cwd.spec ~= nil
-  local virtual = modern and cwd.spec.is_virtual or cwd.scheme and cwd.scheme.is_virtual or false
+  local virtual
+  if modern then
+    virtual = cwd.spec.is_virtual
+  else
+    virtual = cwd.scheme and cwd.scheme.is_virtual or false
+  end
   return {
     command = state.command or DEFAULT_COMMAND,
     cwd = tostring(cwd),

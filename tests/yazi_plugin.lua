@@ -33,6 +33,11 @@ local function environment(options)
   }
 
   local url_mt = {
+    __index = function(_, key)
+      if options.forbid_legacy and key == "scheme" then
+        error("modern URLs must not access deprecated scheme")
+      end
+    end,
     __tostring = function(value)
       return value.raw
     end,
@@ -129,6 +134,14 @@ local function output(code, stdout, stderr)
     stderr = stderr or "",
   }
 end
+
+test("modern real directories never access the deprecated URL scheme", function()
+  local env = environment({ forbid_legacy = true, output = output(0, "") })
+  env.plugin:entry({})
+  assert_equal(#env.notifications, 0, "no deprecated URL access or notification")
+  assert_equal(env.hidden, 0, "terminal restored")
+  assert_equal(env.emits[1].action, "escape", "selection confirmed")
+end)
 
 test("confirmed paths replace selection and reveal the first", function()
   local raw_second = "/photos/sub/two\n\255.png"

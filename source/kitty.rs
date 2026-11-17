@@ -374,15 +374,22 @@ fn random_image_id_origin() -> u32 {
 }
 
 fn next_image_id() -> u32 {
-    NEXT_IMAGE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(if current >= MAX_IMAGE_ID {
-                1
-            } else {
-                current + 1
-            })
-        })
-        .expect("image ID update closure always returns a value")
+    advance_image_id(&NEXT_IMAGE_ID)
+}
+
+fn advance_image_id(counter: &AtomicU32) -> u32 {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = if current >= MAX_IMAGE_ID {
+            1
+        } else {
+            current + 1
+        };
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(previous) => return previous,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn transmit_virtual(image: DynamicImage, size: Size, id: u32, is_tmux: bool) -> String {
@@ -757,6 +764,41 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
+
+    #[test]
+    fn image_id_counter_wraps_without_emitting_zero() {
+        let counter = AtomicU32::new(MAX_IMAGE_ID - 1);
+        assert_eq!(advance_image_id(&counter), MAX_IMAGE_ID - 1);
+        assert_eq!(advance_image_id(&counter), MAX_IMAGE_ID);
+        assert_eq!(advance_image_id(&counter), 1);
+        assert_eq!(advance_image_id(&counter), 2);
+    }
+
+    #[test]
+    fn concurrent_image_id_allocations_are_unique_across_wrap() {
+        let counter = AtomicU32::new(MAX_IMAGE_ID - 3);
+        let mut ids = std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|_| {
+                    let counter = &counter;
+                    scope.spawn(move || {
+                        (0..256)
+                            .map(|_| advance_image_id(counter))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        ids.sort_unstable();
+        let expected = (1..=2044)
+            .chain(MAX_IMAGE_ID - 3..=MAX_IMAGE_ID)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected);
+    }
 
     #[test]
     fn image_id_origins_are_random_per_process_and_in_range() {

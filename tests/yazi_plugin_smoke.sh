@@ -23,7 +23,7 @@ if [[ -z "$smoke_yazi" ]]; then
 fi
 test -x "$smoke_yazi"
 
-export RED_TABLE_SMOKE_BINARY="$PWD/target/debug/red-table"
+export RED_TABLE_SMOKE_BINARY="$(realpath -- "${CARGO_TARGET_DIR:-target}/debug/red-table")"
 export RED_TABLE_SMOKE_COMMAND="$smoke_root/red-table-wrapper"
 export RED_TABLE_SMOKE_DIR="$smoke_root/images"
 export RED_TABLE_SMOKE_MARKER="$smoke_root/started"
@@ -39,18 +39,34 @@ export COLUMNS=80
 expect <<'EXPECT'
 log_user $env(RED_TABLE_SMOKE_LOG_USER)
 set timeout 15
+set stty_init "rows 24 columns 80"
 spawn -noecho $env(RED_TABLE_SMOKE_YAZI) $env(RED_TABLE_SMOKE_DIR)
-after 2500
+proc fail_smoke {message} {
+  global env
+  append message " (picker started: [file exists $env(RED_TABLE_SMOKE_MARKER)], status written: [file exists $env(RED_TABLE_SMOKE_STATUS)])"
+  set child [exp_pid]
+  catch {exec bash -c {kill -TERM -- "-$1" 2>/dev/null || kill -TERM "$1"} bash $child}
+  after 200
+  catch {exec bash -c {kill -KILL -- "-$1" 2>/dev/null || kill -KILL "$1"} bash $child}
+  catch {wait}
+  error $message
+}
+expect_before timeout {fail_smoke "Yazi smoke test timed out waiting for terminal readiness or shutdown"}
+expect -exact "Yazi: images"
+expect -exact "0/0"
+after 200
 send -- "R"
-after 1200
+expect -exact "No supported images found"
 send -- "\023"
-after 700
+expect -exact "Yazi: images"
+expect -exact "0/0"
+after 200
 send -- "q"
-set timeout 5
+set timeout 15
 expect {
   eof {}
-  timeout {
-    send -- "q"
+  -exact "Quit?" {
+    send -- "y"
     expect eof
   }
 }
